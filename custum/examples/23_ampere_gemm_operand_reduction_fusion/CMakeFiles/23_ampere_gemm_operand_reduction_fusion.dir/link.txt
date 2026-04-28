@@ -1,0 +1,1 @@
+/usr/bin/g++ -Wl,--dependency-file=CMakeFiles/23_ampere_gemm_operand_reduction_fusion.dir/link.d @CMakeFiles/23_ampere_gemm_operand_reduction_fusion.dir/objects1.rsp -o 23_ampere_gemm_operand_reduction_fusion @CMakeFiles/23_ampere_gemm_operand_reduction_fusion.dir/linkLibs.rsp -L"/usr/local/cuda/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda/targets/x86_64-linux/lib"

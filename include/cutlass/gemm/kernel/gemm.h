@@ -41,7 +41,9 @@
 #include "cutlass/matrix_coord.h"
 #include "cutlass/semaphore.h"
 #include "cutlass/arch/arch.h"
-
+#ifdef CUTLASS_SLEEP_ENABLED
+#include "cutlass/cutlass_sleep_globals.cuh"
+#endif
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -202,6 +204,53 @@ struct Gemm {
   CUTLASS_DEVICE
   void operator()(Params const &params, SharedStorage &shared_storage) {
 
+// #ifdef CUTLASS_SLEEP_ENABLED
+//     // ── Debug: Block(0,0,0) Thread 0 에서 1회만 커널 파라미터 출력 ──────────
+//     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+//       printf("\n========== CUTLASS GEMM Kernel Launch Info ==========\n");
+
+//       // Grid / Block / Smem
+//       printf("  Grid       : (%u, %u, %u)\n",
+//              gridDim.x,  gridDim.y,  gridDim.z);
+//       printf("  Block      : (%u, %u, %u)\n",
+//              blockDim.x, blockDim.y, blockDim.z);
+//       printf("  SharedMem  : %zu bytes  (%.1f KB)\n",
+//              sizeof(SharedStorage),
+//              sizeof(SharedStorage) / 1024.0f);
+
+//       // Problem size
+//       printf("  Problem    : M=%d  N=%d  K=%d\n",
+//              params.problem_size.m(),
+//              params.problem_size.n(),
+//              params.problem_size.k());
+
+//       // Tile shape (compile-time)
+//       printf("  BlockTile  : %d x %d x %d  (M x N x K)\n",
+//              Mma::Shape::kM, Mma::Shape::kN, Mma::Shape::kK);
+
+//       // Grid tiled shape (how many blocks cover M/N/K)
+//       printf("  GridTiled  : M=%d  N=%d  K=%d  (blocks)\n",
+//              params.grid_tiled_shape.m(),
+//              params.grid_tiled_shape.n(),
+//              params.grid_tiled_shape.k());
+
+//       // gemm_k_size: K partitioned per block
+//       printf("  gemm_k_sz  : %d\n", params.gemm_k_size);
+
+//       // Pipeline stages (compile-time)
+//       printf("  Stages     : %d\n", Mma::Base::kStages);
+
+//       // Sleep params (if enabled)
+// #ifdef CUTLASS_SLEEP_ENABLED
+//       printf("  SleepNs    : %u\n", kCutlassSleepNs);
+//       printf("  SleepFreq  : %u\n", kCutlassSleepFreq);
+// #endif
+
+//       printf("=====================================================\n\n");
+//     }
+//     __syncthreads();   // 모든 thread 가 출력 완료 후 진행
+// #endif  // CUTLASS_SLEEP_ENABLED
+
     // Compute threadblock location
     ThreadblockSwizzle threadblock_swizzle;
 
@@ -258,7 +307,9 @@ struct Gemm {
     // is compiled as warp-uniform.
     int warp_idx = canonical_warp_idx_sync();
     int lane_idx = threadIdx.x % 32;
-
+    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
+    //     __nanosleep(kCutlassSleepNs);
+    // }
     //
     // Main loop
     //
@@ -274,8 +325,18 @@ struct Gemm {
       // Compute threadblock-scoped matrix multiply-add
       mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
     }
-
+    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
+    //       unsigned long long start = clock64();
+    
+    //       while ((clock64() - start) < kCutlassSleepNs) {
+    //           // intentional busy wait
+    //       }
+    // }
+    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
+    //     __nanosleep(kCutlassSleepNs);
+    // }
     //
+    
     // Epilogue
     //
 

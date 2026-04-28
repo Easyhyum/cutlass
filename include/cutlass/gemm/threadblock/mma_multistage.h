@@ -34,6 +34,12 @@
 
 #pragma once
 
+// ── CUTLASS_SLEEP_ENABLED : bf16_gemm_sm80 빌드 시 -DCUTLASS_SLEEP_ENABLED 로 활성화 ──
+// kCutlassSleepNs / kCutlassSleepFreq 정의는 cutlass_sleep_globals.cuh 에 있음.
+// #pragma once 로 보호되므로 bf16_gemm_sm80.cu 에서도 같은 헤더를 include 해도 안전.
+#ifdef CUTLASS_SLEEP_ENABLED
+#include "cutlass/cutlass_sleep_globals.cuh"
+#endif
 
 #include "cutlass/aligned_buffer.h"
 #include "cutlass/arch/memory.h"
@@ -546,6 +552,21 @@ public:
         );
       }
 
+      // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
+      //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
+      //     __nanosleep(kCutlassSleepNs);
+      // }
+      // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
+      //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
+      //       unsigned long long start = clock64();
+      
+      //       while ((clock64() - start) < kCutlassSleepNs) {
+      //           // intentional busy wait
+      //       }
+      // }
+
+
+
       // Except for the last warp-tile, all warp-tiles issue their share of
       // global->shared fragment copies
       if (warp_mma_k < Base::kWarpGemmIterations - 1) {
@@ -591,7 +612,14 @@ public:
         iterator_A.clear_mask(gemm_k_iterations == 0);
         iterator_B.clear_mask(gemm_k_iterations == 0);
       }
-
+    //   if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
+    //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
+    //       unsigned long long start = clock64();
+    
+    //       while ((clock64() - start) < kCutlassSleepNs) {
+    //           // intentional busy wait
+    //       }
+    // }
       // The last warp-tile also converts the shared memory fragments used by
       // the first warp-tile of the next iteration, if necessary (so we can
       // immediately start issuing MMA instructions at the top of the loop )
@@ -659,7 +687,16 @@ public:
       plus<FragmentC> plus_accum;
       accum = plus_accum(accum, pipe_state.tmp_accum_);
     }
-
+    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
+    //       unsigned long long start = clock64();
+    
+    //       while ((clock64() - start) < kCutlassSleepNs) {
+    //           // intentional busy wait
+    //       }
+    // }
+    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
+    //     __nanosleep(kCutlassSleepNs);
+    // }
     // Commit and drain all pending and predicated cp.async pnz from the GEMM mainloop
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();

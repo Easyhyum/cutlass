@@ -1,0 +1,1 @@
+-I/workspace/include -I/workspace/examples/13_two_tensor_op_fusion/. -I/workspace/examples/common -I/workspace/custum/include -I/workspace/tools/util/include -isystem /usr/local/cuda/include

@@ -1,6 +1,6 @@
 ![ALT](./media/images/gemm-hierarchy-with-epilogue-no-labels.png "Complete CUDA GEMM decomposition")
 # Overview
-
+export CUDA_VISIBLE_DEVICES=3
 # CUTLASS 4.4.2
 
 _CUTLASS 4.4.2 - March 2026_
