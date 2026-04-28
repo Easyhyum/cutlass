@@ -1,0 +1,31 @@
+digraph dot {
+subgraph cluster_104 {
+label="graph_104" graph[style="dashed"];
+"graph_104_node_0"[style="bold" shape="record" label="{KERNEL
+| {ID | 0 (topoId: 2) | _ZN7cutlass7Kernel2I68cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_nn_align8EEvNT_6ParamsE\<\<\<\{65536,6\},256,73728\>\>\>}
+| {{node handle | func handle} | {0x000000002AE79C20 | 0x00000000261815C0}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 0}
+| {priority | 0}
+}"];
+
+"graph_104_node_1"[style="bold" shape="record" label="{KERNEL
+| {ID | 1 (topoId: 1) | _ZN7cutlass7Kernel2I67cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_nn_align8EEvNT_6ParamsE\<\<\<\{8,6,7\},128,81920\>\>\>}
+| {{node handle | func handle} | {0x000000002AE79488 | 0x0000000025F849D0}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 0}
+| {priority | 0}
+}"];
+
+"graph_104_node_2"[style="bold" shape="record" label="{KERNEL
+| {ID | 2 (topoId: 0) | _ZN8cublasLt19splitKreduce_kernelILi32ELi16Ei13__nv_bfloat16S1_fS1_Lb0ES1_S1_S1_Lb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS3_SG_PKT9_S7_PSH_PvlPS3_PiSM_SM_SG_SG_SG_SG_SG_\<\<\<\{384,2\},\{32,16\},0\>\>\>}
+| {{node handle | func handle} | {0x000000002AE78CF0 | 0x000000002BAAB340}}
+| {accessPolicyWindow | {base_ptr | num_bytes | hitRatio | hitProp | missProp} | {0x0000000000000000 | 0 | 0.000000 | N | N}}
+| {cooperative | 0}
+| {priority | 0}
+}"];
+
+"graph_104_node_0" -> "graph_104_node_1" [headlabel=0];
+"graph_104_node_1" -> "graph_104_node_2" [headlabel=0];
+}
+}

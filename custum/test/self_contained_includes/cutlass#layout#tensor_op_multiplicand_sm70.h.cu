@@ -1,0 +1,1 @@
+#include <cutlass/layout/tensor_op_multiplicand_sm70.h>

@@ -1,0 +1,1 @@
+#include <cutlass/kernel_hardware_info.hpp>

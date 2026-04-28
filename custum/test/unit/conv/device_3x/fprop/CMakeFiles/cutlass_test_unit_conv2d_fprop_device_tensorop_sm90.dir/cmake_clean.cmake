@@ -1,0 +1,18 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/link.d"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f16.cu.o"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f16.cu.o.d"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f32.cu.o"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_f16_f16_f32_tensorop_f32.cu.o.d"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_s8_s8_s32_tensorop_s32.cu.o"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_s8_s8_s32_tensorop_s32.cu.o.d"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_tf32_tf32_f32_tensorop_f32.cu.o"
+  "CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/sm90_conv2d_fprop_implicit_gemm_tf32_tf32_f32_tensorop_f32.cu.o.d"
+  "cutlass_test_unit_conv2d_fprop_device_tensorop_sm90"
+  "cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.pdb"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CUDA CXX)
+  include(CMakeFiles/cutlass_test_unit_conv2d_fprop_device_tensorop_sm90.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

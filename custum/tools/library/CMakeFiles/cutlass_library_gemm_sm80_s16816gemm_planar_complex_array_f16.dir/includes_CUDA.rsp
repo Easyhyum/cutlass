@@ -1,0 +1,1 @@
+-I/workspace/include -I/workspace/custum/include -I/workspace/tools/library/include -I/workspace/tools/util/include -isystem /usr/local/cuda/include
