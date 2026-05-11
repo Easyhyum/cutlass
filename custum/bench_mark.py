@@ -54,6 +54,7 @@ NUM_HEADS    = 32
 NUM_KV_HEADS = 8
 HEAD_DIM     = 128
 NUM_LAYERS   = 36
+ACTUAL_FORWARD_LAYERS = 32
 VOCAB_SIZE   = 151936   # 151936 = 9496 × 16, WMMA-safe
 
 device_id = 3
@@ -146,6 +147,180 @@ def build_layer_matmuls(B, S):
     # LM head: once
     # matmuls.append((BS, HIDDEN, VOCAB_SIZE, "lm_head", 1))
     return matmuls
+
+
+def build_qwen_forward_linear_matmuls(B, S, include_lm_head=True,
+                                      num_layers=NUM_LAYERS):
+    """Qwen3-8B forward에서 FlashAttention 자체를 제외한 linear matmul 목록.
+
+    Attention Q/K/V/O projections and MLP projections are matrix multiplications;
+    QK/AV attention BMM은 FlashAttention 측정값으로 따로 더한다.
+    """
+    q_dim = NUM_HEADS * HEAD_DIM
+    kv_dim = NUM_KV_HEADS * HEAD_DIM
+    BS = ((B * S + 15) // 16) * 16
+
+    per_layer = [
+        (BS, HIDDEN, q_dim, "attn_q_proj", num_layers),
+        (BS, HIDDEN, kv_dim, "attn_k_proj", num_layers),
+        (BS, HIDDEN, kv_dim, "attn_v_proj", num_layers),
+        (BS, HIDDEN, q_dim, "attn_o_proj", num_layers),
+        (BS, HIDDEN, INTER, "mlp_gate_proj", num_layers),
+        (BS, HIDDEN, INTER, "mlp_up_proj", num_layers),
+        (BS, INTER, HIDDEN, "mlp_down_proj", num_layers),
+    ]
+    if include_lm_head:
+        per_layer.append((BS, HIDDEN, VOCAB_SIZE, "lm_head", 1))
+    return per_layer
+
+
+def matmul_flops(rows):
+    return sum(2.0 * m * k * n * count for m, k, n, _name, count in rows)
+
+
+def qwen_flash_attention_flops(B, S, num_layers=NUM_LAYERS):
+    """Approximate QK^T + Attn*V FLOPs for all Qwen3-8B layers."""
+    s_aligned = ((S + 15) // 16) * 16
+    per_layer = 4.0 * B * NUM_HEADS * s_aligned * s_aligned * HEAD_DIM
+    return per_layer * num_layers
+
+
+def _sdpa_flash(q, k, v):
+    """Run SDPA with FlashAttention backend only."""
+    import torch.nn.functional as F
+
+    with torch.backends.cuda.sdp_kernel(
+            enable_flash=True,
+            enable_math=False,
+            enable_mem_efficient=False):
+        try:
+            return F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=True)
+        except TypeError:
+            if k.size(1) != q.size(1):
+                repeat = q.size(1) // k.size(1)
+                k = k.repeat_interleave(repeat, dim=1).contiguous()
+                v = v.repeat_interleave(repeat, dim=1).contiguous()
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+def make_qwen3_kernel_forward_fn(B, S, matmul_kernel, sleep_ns, sleep_freq,
+                                 cutlass_sm80):
+    """Actual CUDA forward kernel sequence for Qwen3-8B block stack.
+
+    This uses synthetic weights/activations but executes the forward kernels in
+    model order: Q/K/V projections, FlashAttention, O projection, MLP gate/up/down
+    for ACTUAL_FORWARD_LAYERS. LM head is intentionally excluded because full prefill logits
+    for B*S by VOCAB_SIZE are impractically large for the current benchmark shape.
+    """
+    q_dim = NUM_HEADS * HEAD_DIM
+    kv_dim = NUM_KV_HEADS * HEAD_DIM
+    BS = ((B * S + 15) // 16) * 16
+    import torch.nn.functional as F
+
+    hidden = torch.randn(BS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    weights = {
+        "q": torch.randn(HIDDEN, q_dim, device="cuda", dtype=torch.bfloat16),
+        "k": torch.randn(HIDDEN, kv_dim, device="cuda", dtype=torch.bfloat16),
+        "v": torch.randn(HIDDEN, kv_dim, device="cuda", dtype=torch.bfloat16),
+        "o": torch.randn(q_dim, HIDDEN, device="cuda", dtype=torch.bfloat16),
+        "gate": torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.bfloat16),
+        "up": torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.bfloat16),
+        "down": torch.randn(INTER, HIDDEN, device="cuda", dtype=torch.bfloat16),
+    }
+
+    def _mm(a, b):
+        if matmul_kernel == "cublas":
+            return torch.mm(a, b)
+        if matmul_kernel == "cutlass_sm80":
+            if cutlass_sm80 is None:
+                raise RuntimeError("cutlass_sm80 module is not available")
+            return cutlass_sm80.gemm_sm80_v3(
+                a.contiguous(), b.contiguous(),
+                sleep_ns=sleep_ns, sleep_freq=sleep_freq)
+        raise ValueError(f"unknown matmul kernel: {matmul_kernel}")
+
+    def _forward_once():
+        x = hidden
+        for _ in range(ACTUAL_FORWARD_LAYERS):
+            q = _mm(x, weights["q"]).view(B, S, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+            k = _mm(x, weights["k"]).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
+            v = _mm(x, weights["v"]).view(B, S, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
+            attn = _sdpa_flash(q, k, v).transpose(1, 2).contiguous().view(BS, q_dim)
+            _ = _mm(attn, weights["o"])
+
+            gate = _mm(x, weights["gate"])
+            up = _mm(x, weights["up"])
+            mlp = F.silu(gate).mul_(up)
+            _ = _mm(mlp, weights["down"])
+        return x
+
+    return _forward_once
+
+
+def qwen3_forward_kernel_flops(B, S, include_lm_head=False):
+    linear = matmul_flops(
+        build_qwen_forward_linear_matmuls(
+            B, S,
+            include_lm_head=include_lm_head,
+            num_layers=ACTUAL_FORWARD_LAYERS))
+    return linear + qwen_flash_attention_flops(
+        B, S, num_layers=ACTUAL_FORWARD_LAYERS)
+
+
+def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
+                                 cutlass_sm80, handle, args):
+    """Measure an actual synthetic Qwen3-8B forward kernel sequence."""
+    try:
+        fn = make_qwen3_kernel_forward_fn(
+            B, S, matmul_kernel, sleep_ns, sleep_freq, cutlass_sm80)
+        # Warmup once to pay allocator/kernel selection cost outside measurement.
+        fn()
+        torch.cuda.synchronize()
+        ni = 1
+        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples = measure(
+            fn, ni, handle, sample_interval=args.nvml_interval)
+        flops = qwen3_forward_kernel_flops(B, S, include_lm_head=False)
+        gflops = flops * ni / (el / 1000.0) / 1e9
+        nj = en * 1e6 / (flops * ni) if ni > 0 else 0.0
+        print(
+            f"  {'actual_forward':14s} | {matmul_kernel:12s} "
+            f"sleep={sleep_ns:6d}ns freq={sleep_freq:4d} iters={ni:3d} | "
+            f"{el:8.1f}ms {gflops:8.1f}GF {pw:6.1f}W "
+            f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C "
+            f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
+        return {
+            "batch_size": B,
+            "seq_len": S,
+            "num_layers": ACTUAL_FORWARD_LAYERS,
+            "matmul_kernel": matmul_kernel,
+            "sleep_ns": sleep_ns,
+            "sleep_freq": sleep_freq,
+            "attention_kernel": "flashattention_sdpa",
+            "num_iters": ni,
+            "elapsed_ms": el,
+            "energy_mj": en,
+            "power_w": pw,
+            "sm_clock_mhz": sm_clk,
+            "temp_c": temp,
+            "gflops": gflops,
+            "nj_per_flop": nj,
+            "total_flops": flops,
+            "power_violation_before_ns": pv_bef,
+            "reference_time_before_ns": ref_bef,
+            "power_violation_during_ns": pv_dur,
+            "reference_time_during_ns": ref_dur,
+            "power_violation_ratio": pv_rat,
+        }
+    except Exception as e:
+        print(
+            f"  ⚠ actual forward skipped: kernel={matmul_kernel} "
+            f"sleep={sleep_ns} freq={sleep_freq}: {e}")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return None
 
 
 # ─────────────────────────── helpers ───────────────────────────
@@ -884,11 +1059,13 @@ def main():
     # sleep_ns_list = [0] + [2 ** (i) for i in range(5, 19)]
     # sleep_ns_list = [2 * i for i in range(1, 200)]
     # sleep_ns_list = [0, 8, 16, 512, 1024, 4096, 8192, 16384, 32768]
+    # sleep_ns_list = sorted(sleep_ns_list, reverse=True)
     # sleep_ns_list = [0, 16, 32768, 131072]
     # sleep_ns_list   = [0, 500, 1000, 1500, 2000, 2500]
-    # sleep_ns_list = [0, 100, 200, 300, 400 ,500 ,600 ,700, 800, 900, 1000, 1500, 2000]
-    # sleep_ns_list = [0, 200, 500, 600, 700, 800]
-    sleep_ns_list = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    sleep_ns_list = [0, 100, 800, 1600, 2400, 3600, 7200]
+    # sleep_ns_list = sorted(sleep_ns_list, reverse=True)
+    # sleep_ns_list = [0, 100, 200, 500, 600, 700, 800]
+    # sleep_ns_list = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
     # sleep_ns_list = [0, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
     # sleep_ns_list = [140,141,142,143,144,145,146,147,148,149,150]
     # sleep_freq_list = [0, 1, 4, 16, 64, 256, 1024]
@@ -905,6 +1082,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
     results = []
+    actual_forward_results = []
     detail_sink = None
     stem, _ext = os.path.splitext(args.output_csv)
     detail_csv_path = f"{stem}_{pid}_detail.csv"
@@ -977,6 +1155,27 @@ def main():
                 matmuls = build_layer_matmuls(batch_sz, S)
                 total_flops_fwd = sum(2.0 * m * k * n * cnt
                                       for m, k, n, _, cnt in matmuls)
+                print(f"\n{'='*72}")
+                print(
+                    f"  Actual Qwen3-8B forward kernel sequence  "
+                    f"B={batch_sz}  S={S}  layers={ACTUAL_FORWARD_LAYERS}  "
+                    "(FlashAttention + real GEMM launches, no estimate)")
+                print(f"{'='*72}")
+                for _kernel in ("cublas", "cutlass_sm80"):
+                    if _kernel == "cutlass_sm80" and cutlass_sm80 is None:
+                        continue
+                    _sleep_iter = sleep_ns_list if _kernel == "cutlass_sm80" else [0]
+                    for _sns in _sleep_iter:
+                        for _sfreq in sleep_freq_list:
+                            row = measure_qwen3_actual_forward(
+                                batch_sz, S, _kernel, _sns, _sfreq,
+                                cutlass_sm80, handle, args)
+                            if row is not None:
+                                row["label"] = args.run_label.strip() or test_case
+                                row["pid"] = pid
+                                row["test_case"] = "QWEN3_8B_ACTUAL_FORWARD"
+                                actual_forward_results.append(row)
+                            time.sleep(1)
 
                 # 기준 토큰 수 (256 × 16 = 4096) 대비 비율로 warmup/ni 스케일
                 if batch_sz * S >= 256 * 16:
@@ -1239,7 +1438,9 @@ def main():
                             if cutlass_sm80 is not None:
                                 _A_bf16_cont = A_bf16.contiguous()
                                 _B_bf16_cont = B_bf16.contiguous()
-                                kernel_sweep.append((
+                                # cutlass_sm80 기준값을 먼저 확보해 이후 커널 로그에서
+                                # 같은 sleep 값 기준 성능/SM clock 비교가 가능하게 한다.
+                                kernel_sweep.insert(0, (
                                     "cutlass_sm80",
                                     lambda _s, _f,
                                         _A=_A_bf16_cont, _B=_B_bf16_cont:
@@ -1319,6 +1520,17 @@ def main():
 
                             # cuBLAS baseline: sleep 없음
                             gf_cublas = gf  # 앞서 측정한 cuBLAS GFLOP/s (비율 계산용)
+                            cutlass_sm80_base = None
+                            cutlass_sm80_by_sleep = {}
+
+                            def _fmt_ratio(v, base):
+                                return f"{(v / base):.2f}×" if base and base > 0 else "n/a"
+
+                            def _fmt_sm_delta(v, base):
+                                if not base or base <= 0:
+                                    return "n/a"
+                                return f"{(v / base):.2f}×, Δ{(v - base):+.0f}MHz"
+
                             # gf_cublas = 100
                             for kname, kfn, has_sleep in kernel_sweep:
                                 sns_iter = sleep_ns_list
@@ -1355,7 +1567,35 @@ def main():
                                             torch.cuda.nvtx.range_pop()
                                         gf_k = flops_per_gemm * ni / (el / 1000) / 1e9
                                         nj_k = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
-                                        ratio = gf_k / gf_cublas if gf_cublas > 0 else 0
+                                        if kname == "cutlass_sm80":
+                                            ref = {
+                                                "gflops": gf_k,
+                                                "sm_clock_mhz": sm_clk,
+                                            }
+                                            cutlass_sm80_by_sleep[(sns, sfreq)] = ref
+                                            if cutlass_sm80_base is None and sns == 0:
+                                                cutlass_sm80_base = ref
+
+                                        cmp_parts = [
+                                            f"vs cuBLAS: {_fmt_ratio(gf_k, gf_cublas)}",
+                                        ]
+                                        if cutlass_sm80_base is not None:
+                                            cmp_parts.extend([
+                                                "vs cutlass_sm80@0ns: "
+                                                f"{_fmt_ratio(gf_k, cutlass_sm80_base['gflops'])}",
+                                                "SM/cutlass_sm80@0ns: "
+                                                f"{_fmt_sm_delta(sm_clk, cutlass_sm80_base['sm_clock_mhz'])}",
+                                            ])
+
+                                        same_sleep_ref = cutlass_sm80_by_sleep.get((sns, sfreq))
+                                        if same_sleep_ref is not None and kname != "cutlass_sm80":
+                                            cmp_parts.extend([
+                                                f"vs cutlass_sm80@sleep={sns}ns: "
+                                                f"{_fmt_ratio(gf_k, same_sleep_ref['gflops'])}",
+                                                f"SM/cutlass_sm80@sleep={sns}ns: "
+                                                f"{_fmt_sm_delta(sm_clk, same_sleep_ref['sm_clock_mhz'])}",
+                                            ])
+
                                         print(f"  {kname:14s} | sleep={sns:6d}ns freq={sfreq:4d}  "
                                             f"iters={ni:5d} | "
                                             f"{el:8.1f}ms {gf_k:8.1f}GF {pw:6.1f}W "
@@ -1363,7 +1603,7 @@ def main():
                                             f"SM={sm_clk:.0f}MHz  T={temp:.0f}°C  "
                                             f"PVpre={pv_bef}ns/{ref_bef}ns "
                                             f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)  "
-                                            f"[vs cuBLAS: {ratio:.2f}×]")
+                                            f"[{' | '.join(cmp_parts)}]")
                                         rec = dict(
                                             batch_size=batch_sz, seq_len=S,
                                             layer=name, count=count,
@@ -1532,8 +1772,38 @@ def main():
                 for sr in summary_rows:
                     w.writerow(sr)
 
+            actual_forward_csv = f"{stem}_{pid}_actual_forward.csv"
+            if actual_forward_results:
+                actual_forward_fields = [
+                    "label", "pid", "test_case",
+                    "batch_size", "seq_len",
+                    "num_layers",
+                    "matmul_kernel", "sleep_ns", "sleep_freq",
+                    "attention_kernel", "num_iters",
+                    "elapsed_ms", "energy_mj", "power_w",
+                    "gflops", "nj_per_flop", "total_flops",
+                    "sm_clock_mhz", "temp_c",
+                    "power_violation_before_ns", "reference_time_before_ns",
+                    "power_violation_during_ns", "reference_time_during_ns",
+                    "power_violation_ratio",
+                ]
+                with open(actual_forward_csv, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=actual_forward_fields)
+                    w.writeheader()
+                    for row in actual_forward_results:
+                        out = dict(row)
+                        for k in (
+                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "nj_per_flop", "total_flops", "sm_clock_mhz",
+                            "temp_c", "power_violation_ratio"):
+                            if k in out and isinstance(out[k], float):
+                                out[k] = round(out[k], 4)
+                        w.writerow(out)
+
             print(f"\n✅ Detail (streaming NVML, label={run_label!r}) → {detail_csv_path}")
             print(f"✅ Summary (aggregated)                  → {summary_csv}")
+            if actual_forward_results:
+                print(f"✅ Actual forward (FlashAttention + GEMM) → {actual_forward_csv}")
     finally:
         if detail_sink is not None:
             detail_sink.close()

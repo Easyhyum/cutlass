@@ -667,10 +667,8 @@ public:
         threadIdx.y * blockDim.x +
         threadIdx.x;
     unsigned int const warp_in_cta = tid / 32u;
-    unsigned int const total_warps = blockDim.x / 32u;
     unsigned int smid = 0u;
     asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    unsigned long long __mma_t0;
     // Disable global fetching if done with global fetch iterations
     iterator_A.clear_mask(gemm_k_iterations == 0);
     iterator_B.clear_mask(gemm_k_iterations == 0);
@@ -698,6 +696,20 @@ public:
 
     // Outer mainloop iteration counter (for optional debug / timing hooks)
     // int k_gemm_outer_iter = 0;
+
+#ifdef CUTLASS_SLEEP_ENABLED
+    if (kCutlassSleepNs > 0u && gemm_k_iterations > Base::kStages) {
+      // One-time phase offset for compute-bound kernels. This staggers CTA/warp
+      // entry into the mainloop without perturbing the inner MMA pipeline.
+      unsigned int const phase = (smid + warp_in_cta) % 10u;
+      unsigned long long const phase_cycles =
+          static_cast<unsigned long long>(phase) * kCutlassSleepNs;
+      unsigned long long const __mma_t0 = clock64();
+      while ((clock64() - __mma_t0) < phase_cycles) {
+        // intentional phase offset
+      }
+    }
+#endif
 
     // Mainloop
     CUTLASS_GEMM_LOOP
@@ -734,31 +746,6 @@ public:
 //         }
 //       }
 // #endif
-      // if (gemm_k_iterations < 62 * 0.7 && warp_in_cta % 4 == gemm_k_iterations % 4) {
-      // if (gemm_k_iterations > 62 * 0.1 && (smid % 16) == (gemm_k_iterations % 16) && warp_in_cta % 4 == gemm_k_iterations % 4){
-        // unsigned long long const __mma_t0 = clock64();
-        // __nanosleep(kCutlassSleepNs);
-        // while ((clock64() - __mma_t0) < kCutlassSleepNs) {
-        //   // intentional busy wait
-        // }
-      // }
-      if (kCutlassSleepNs >= 0u)
-      {
-        // __nanosleep(kCutlassSleepNs * warp_in_cta);
-
-        for (int i = 0; i< kCutlassSleepNs * warp_in_cta; i++) {
-          // __nanosleep(1);
-          __mma_t0 = clock64();
-          // asm volatile ("nop;");
-          // asm volatile ("");
-        }
-        // unsigned long long const __mma_t0 = clock64();
-        // while ((clock64() - __mma_t0) < warp_in_cta * kCutlassSleepNs) {
-        //   // intentional busy wait
-        //   __nanosleep(1);
-        // }
-      }
-
       mac_loop_iter(
         pipe_state,
         accum,
