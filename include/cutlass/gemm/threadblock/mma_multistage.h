@@ -51,6 +51,10 @@
 
 #include "cutlass/gemm/threadblock/mma_base.h"
 
+#if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
+#include <stdio.h>
+#endif
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -520,6 +524,23 @@ public:
       this->warp_tile_iterator_B_.load(pipe_state.warp_loaded_frag_B_[(warp_mma_k + 1) % 2]);
       ++this->warp_tile_iterator_B_;
 
+
+      // #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
+      //       if (kCutlassSleepNs != 0 && warp_mma_k == 1) {
+      //         unsigned long long const __mma_t0 = clock64();
+      //         unsigned int const tid =
+      //             threadIdx.z * blockDim.y * blockDim.x +
+      //             threadIdx.y * blockDim.x +
+      //             threadIdx.x;
+      //         unsigned int const warp_in_cta = tid / 32u;
+              
+      //         if (gemm_k_iterations % 8 == warp_in_cta % 8)
+      //         // __nanosleep(kCutlassSleepNs);
+      //           while ((clock64() - __mma_t0) < kCutlassSleepNs) {
+      //             // intentional busy wait
+      //           }
+      //       }
+      // #endif
       // Except for the first warp-tile, all warp-tiles convert their incoming shared memory fragments as necessary
       if (warp_mma_k > 0) {
         warp_mma_.transform(
@@ -551,22 +572,25 @@ public:
           accum
         );
       }
-
-      // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
-      //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
-      //     __nanosleep(kCutlassSleepNs);
+// #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
+      // unsigned long long const __mma_cycles = clock64() - __mma_t0;
+      // if ((threadIdx.x & 31u) == 0u) {
+      //   unsigned int const tid =
+      //       threadIdx.z * blockDim.y * blockDim.x +
+      //       threadIdx.y * blockDim.x +
+      //       threadIdx.x;
+      //   unsigned int const warp_in_cta = tid / 32u;
+      //   printf(
+      //       "[MMA_TIMING] warp_in_cta=%u warp_mma_k=%d mma_cycles=%llu "
+      //       "blk=(%u,%u,%u)\n",
+      //       warp_in_cta,
+      //       warp_mma_k,
+      //       __mma_cycles,
+      //       blockIdx.x,
+      //       blockIdx.y,
+      //       blockIdx.z);
       // }
-      // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
-      //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
-      //       unsigned long long start = clock64();
-      
-      //       while ((clock64() - start) < kCutlassSleepNs) {
-      //           // intentional busy wait
-      //       }
-      // }
-
-
-
+// #endif
       // Except for the last warp-tile, all warp-tiles issue their share of
       // global->shared fragment copies
       if (warp_mma_k < Base::kWarpGemmIterations - 1) {
@@ -612,14 +636,6 @@ public:
         iterator_A.clear_mask(gemm_k_iterations == 0);
         iterator_B.clear_mask(gemm_k_iterations == 0);
       }
-    //   if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u &&
-    //     (static_cast<unsigned int>(warp_mma_k) % kCutlassSleepFreq) == 0u) {
-    //       unsigned long long start = clock64();
-    
-    //       while ((clock64() - start) < kCutlassSleepNs) {
-    //           // intentional busy wait
-    //       }
-    // }
       // The last warp-tile also converts the shared memory fragments used by
       // the first warp-tile of the next iteration, if necessary (so we can
       // immediately start issuing MMA instructions at the top of the loop )
@@ -646,7 +662,15 @@ public:
       IteratorB &iterator_B)        ///< [in|out] iterator over B operand in global memory
   {
     PipeState pipe_state;
-
+    unsigned int const tid =
+        threadIdx.z * blockDim.y * blockDim.x +
+        threadIdx.y * blockDim.x +
+        threadIdx.x;
+    unsigned int const warp_in_cta = tid / 32u;
+    unsigned int const total_warps = blockDim.x / 32u;
+    unsigned int smid = 0u;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    unsigned long long __mma_t0;
     // Disable global fetching if done with global fetch iterations
     iterator_A.clear_mask(gemm_k_iterations == 0);
     iterator_B.clear_mask(gemm_k_iterations == 0);
@@ -672,15 +696,76 @@ public:
       pipe_state.tmp_accum_.clear();
     }
 
+    // Outer mainloop iteration counter (for optional debug / timing hooks)
+    // int k_gemm_outer_iter = 0;
+
     // Mainloop
     CUTLASS_GEMM_LOOP
     for (; gemm_k_iterations > (-Base::kStages + 1);) {
+// #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
+//       if (k_gemm_outer_iter == 0) {
+//         unsigned int const tid =
+//             threadIdx.z * blockDim.y * blockDim.x +
+//             threadIdx.y * blockDim.x +
+//             threadIdx.x;
+//         unsigned int const warp_in_cta = tid / 32u;
+//         // warp 0, lane 0 만 출력 (한 블록당 한 줄)
+//         if (warp_in_cta == 0u && (threadIdx.x & 31u) == 0u) {
+//           unsigned int smid = 0u;
+//           asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+//           unsigned int const block_linear =
+//               blockIdx.x +
+//               blockIdx.y * gridDim.x +
+//               blockIdx.z * gridDim.x * gridDim.y;
+//           printf(
+//               "[CUTLASS_GEMM] outer_iter=%d smid=%u warp_in_cta=%u block_linear=%u "
+//               "blockIdx=(%u,%u,%u) gridDim=(%u,%u,%u) gemm_k_iterations=%d\n",
+//               k_gemm_outer_iter,
+//               smid,
+//               warp_in_cta,
+//               block_linear,
+//               blockIdx.x,
+//               blockIdx.y,
+//               blockIdx.z,
+//               gridDim.x,
+//               gridDim.y,
+//               gridDim.z,
+//               gemm_k_iterations);
+//         }
+//       }
+// #endif
+      // if (gemm_k_iterations < 62 * 0.7 && warp_in_cta % 4 == gemm_k_iterations % 4) {
+      // if (gemm_k_iterations > 62 * 0.1 && (smid % 16) == (gemm_k_iterations % 16) && warp_in_cta % 4 == gemm_k_iterations % 4){
+        // unsigned long long const __mma_t0 = clock64();
+        // __nanosleep(kCutlassSleepNs);
+        // while ((clock64() - __mma_t0) < kCutlassSleepNs) {
+        //   // intentional busy wait
+        // }
+      // }
+      if (kCutlassSleepNs >= 0u)
+      {
+        // __nanosleep(kCutlassSleepNs * warp_in_cta);
+
+        for (int i = 0; i< kCutlassSleepNs * warp_in_cta; i++) {
+          // __nanosleep(1);
+          __mma_t0 = clock64();
+          // asm volatile ("nop;");
+          // asm volatile ("");
+        }
+        // unsigned long long const __mma_t0 = clock64();
+        // while ((clock64() - __mma_t0) < warp_in_cta * kCutlassSleepNs) {
+        //   // intentional busy wait
+        //   __nanosleep(1);
+        // }
+      }
+
       mac_loop_iter(
         pipe_state,
         accum,
         iterator_A,
         iterator_B,
         gemm_k_iterations);
+      // ++k_gemm_outer_iter;
     }
 
     if (Detail::kStagedAccumulation) {

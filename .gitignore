@@ -2,3 +2,10 @@
 __pycache__/
 cutlass_library.egg-info/
 /build*
+
+*
+!custum/
+!include/cutlass/gemm/threadblock/mma_multistage.h
+!include/cutlass/gemm/threadblock/mma_multistage.cuh
+!include/cutlass/gemm/threadblock/mma_multistage.cu
+!include/cutlass/gemm/kernel/gemm.h

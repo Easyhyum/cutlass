@@ -39,6 +39,9 @@ import argparse
 import time
 import os
 import csv
+import subprocess
+import sys
+from collections import defaultdict
 import multiprocessing as mp
 import torch
 import pynvml
@@ -131,7 +134,7 @@ def build_layer_matmuls(B, S):
         # (BS, HIDDEN, q_dim + kv_dim * 2, "attn_qkv_proj"),
         # (BS, HIDDEN, INTER,  "mlp_gate_proj"),
         (BS, HIDDEN, INTER,  "mlp_up_proj"),
-        (BS, INTER,  HIDDEN, "mlp_down_proj"),
+        # (BS, INTER,  HIDDEN, "mlp_down_proj"),
     ]
     matmuls = [(m, k, n, name, NUM_LAYERS) for m, k, n, name in linear_per_layer]
 
@@ -173,12 +176,40 @@ def auto_iterations(fn, target_seconds=2.0, pilot_iters=10):
 #    ("exit",)        : 프로세스 종료
 #
 #  result_q (sampler → main):
-#    (power_list, sm_list, temp_list) : stop 명령 처리 후 1회 put
+#    (time_ms_list, power_mw_list, sm_list, temp_list) : stop 명령 처리 후 1회 put
+#    power_mw_list[i] = mW; 기본 nvmlDeviceGetPowerUsage, 또는 --gpu-power-source
+#      nvidia_smi_instant 일 때 nvidia-smi power.draw.instant 과 같은 계열.
+#    time_ms_list[i] = 샘플 루프 시작(base) 기준 경과 시간(ms)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _instant_power_mw_nvidia_smi(device_idx: int) -> int:
+    """nvidia-smi power.draw.instant (W) → 정수 mW. gpu_power_log CLI 와 정합."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "-i",
+                str(device_idx),
+                "--query-gpu=power.draw.instant",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        line = proc.stdout.strip().splitlines()[0].strip()
+        return int(round(float(line) * 1000.0))
+    except Exception:
+        return 0
+
 
 def _nvml_sampler_proc(device_idx: int, interval: float,
                         cmd_q: mp.Queue, result_q: mp.Queue,
-                        ready_ev: mp.Event) -> None:
+                        ready_ev: mp.Event, power_source: str = "nvml") -> None:
     """프로그램 시작 시 1회 spawn. cmd_q 명령으로 start/stop/exit 제어."""
     import queue as _queue
     pynvml.nvmlInit()
@@ -191,32 +222,45 @@ def _nvml_sampler_proc(device_idx: int, interval: float,
             break
 
         # ── "start" 수신: 수집 루프 진입 ─────────────────────────────────
-        power_samples: list = []
-        sm_samples:    list = []
-        temp_samples:  list = []
-
+        # 한 루프마다 (시간, power_mW, SM MHz, °C) 동시에 1개씩만 append → 길이 항상 일치
+        ts_samples: list = []
+        power_mw_samples: list = []
+        sm_samples: list = []
+        temp_samples: list = []
+        t_loop0 = time.perf_counter()
         while True:
+            t_rel_ms = (time.perf_counter() - t_loop0) * 1000.0
+            ts_samples.append(t_rel_ms)
+            pw_mw = 0
+            if power_source == "nvidia_smi_instant":
+                pw_mw = _instant_power_mw_nvidia_smi(device_idx)
+            else:
+                try:
+                    pw_mw = int(pynvml.nvmlDeviceGetPowerUsage(handle))
+                except pynvml.NVMLError:
+                    pass
+            power_mw_samples.append(pw_mw)
+            sm = 0.0
             try:
-                power_samples.append(
-                    pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
-            except pynvml.NVMLError:
-                pass
-            try:
-                sm_samples.append(pynvml.nvmlDeviceGetClockInfo(
+                sm = float(pynvml.nvmlDeviceGetClockInfo(
                     handle, pynvml.NVML_CLOCK_SM))
             except pynvml.NVMLError:
                 pass
+            sm_samples.append(sm)
+            tc = 0.0
             try:
-                temp_samples.append(pynvml.nvmlDeviceGetTemperature(
+                tc = float(pynvml.nvmlDeviceGetTemperature(
                     handle, pynvml.NVML_TEMPERATURE_GPU))
             except pynvml.NVMLError:
                 pass
+            temp_samples.append(tc)
 
             # interval 동안 대기하되 "stop"/"exit" 가 오면 즉시 탈출
             try:
                 next_cmd = cmd_q.get(timeout=interval)
                 if next_cmd in ("stop", "exit"):
-                    result_q.put((power_samples, sm_samples, temp_samples))
+                    result_q.put(
+                        (ts_samples, power_mw_samples, sm_samples, temp_samples))
                     if next_cmd == "exit":
                         pynvml.nvmlShutdown()
                         return
@@ -233,7 +277,8 @@ _sampler_cmd_q    = None  # mp.Queue
 _sampler_result_q = None  # mp.Queue
 
 
-def start_sampler(device_idx: int, interval: float = 0.1) -> None:
+def start_sampler(device_idx: int, interval: float = 0.01,
+                  power_source: str = "nvml") -> None:
     """프로그램 시작 시 1회 호출. sampler 프로세스를 spawn 하고 준비 대기."""
     global _sampler_proc, _sampler_cmd_q, _sampler_result_q
     ctx = mp.get_context("spawn")
@@ -242,7 +287,9 @@ def start_sampler(device_idx: int, interval: float = 0.1) -> None:
     ready_ev          = ctx.Event()
     _sampler_proc = ctx.Process(
         target=_nvml_sampler_proc,
-        args=(device_idx, interval, _sampler_cmd_q, _sampler_result_q, ready_ev),
+        args=(
+            device_idx, interval, _sampler_cmd_q, _sampler_result_q, ready_ev,
+            power_source),
         daemon=True,
     )
     _sampler_proc.start()
@@ -256,17 +303,96 @@ def stop_sampler() -> None:
         _sampler_proc.join(timeout=5.0)
 
 
-def measure(fn, num_iters, handle, sample_interval=0.1):
+def _nvml_power_violation_snapshot_ns(handle):
+    """nvmlDeviceGetViolationStatus(NVML_PERF_POLICY_POWER).
+
+    Returns:
+        (violation_time_ns, reference_time_ns) 누적 카운터. 실패 시 (0, 0).
+
+    See:
+        https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html
+    """
+    try:
+        st = pynvml.nvmlDeviceGetViolationStatus(
+            handle, pynvml.NVML_PERF_POLICY_POWER)
+        # print(st)
+        return int(st.violationTime), int(st.referenceTime)
+    except Exception:
+        return 0, 0
+
+
+def _nvml_violation_delta_ns(v0: int, r0: int, v1: int, r1: int) -> tuple[int, int]:
+    """누적 violation/reference 카운터 차이(ns). 음수는 0으로 클램프."""
+    dv = max(0, v1 - v0)
+    dr = max(0, r1 - r0)
+    return dv, dr
+
+
+def _nvml_power_management_limit_w(handle):
+    """현재 GPU 전력 상한(NVML power management limit), 단위 W."""
+    try:
+        mw = int(pynvml.nvmlDeviceGetPowerManagementLimit(handle))
+        return mw / 1000.0
+    except Exception:
+        return 0.0
+
+
+# 커널 전·후 NVML 스트림에 idle→부스트 구간을 넣기 위한 여유 (detail 플롯용)
+MEASURE_PRE_MARGIN_S = 0.5
+MEASURE_POST_MARGIN_S = 0.5
+
+
+def measure(
+    fn,
+    num_iters,
+    handle,
+    sample_interval=0.1,
+    pre_measure_samples: int = 5,
+):
     """Run *fn()* num_iters times.
 
-    Returns (elapsed_ms, energy_mJ, avg_power_W, avg_sm_clock_mhz, avg_temp_c).
+    Returns:
+        elapsed_ms, energy_mJ, avg_power_W, avg_sm_clock_mhz, avg_temp_c,
+        power_violation_before_ns, reference_time_before_ns,
+        power_violation_during_ns, reference_time_during_ns, power_violation_ratio,
+        gpu_power_cap_w, nvml_samples.
+
+        gpu_power_cap_w: NVML nvmlDeviceGetPowerManagementLimit 기준 현재 설정 상한(W).
+
+        nvml_samples: 해당 구간 NVML 주기 샘플 목록. 각 원소는
+        sample_index, sample_time_ms(첫 샘플 대비 ms), sample_power_mw(NVML 정수 mW),
+        sample_power_w(sample_power_mw/1000),
+        sample_sm_clock_mhz, sample_temp_c.
+
+    전력 위반·참조 시간은 ``nvmlDeviceGetViolationStatus(..., NVML_PERF_POLICY_POWER)``
+    의 누적 카운터 차이(나노초 정수). ratio = violation_during_ns / reference_during_ns.
+
+    NVML 시계열은 ``start`` 직후 약 MEASURE_PRE_MARGIN_S 초 idle·클럭 상승 구간,
+    커널 실행, ``stop`` 직전 약 MEASURE_POST_MARGIN_S 초를 포함한다.
+    요약 전력·SM·온도·에너지는 커널 실행 구간(시간 기준)에 해당하는 샘플만 평균한다.
 
     persistent sampler 프로세스에 start/stop 명령을 보내 GIL 간섭 없이 수집.
-    프로세스 spawn 오버헤드가 없어 매 측정마다 빠르게 시작/종료된다.
     """
-    _sampler_cmd_q.put("start")
+    interval_s = float(sample_interval)
 
     torch.cuda.synchronize()
+    gpu_power_cap_w = _nvml_power_management_limit_w(handle)
+
+    # ── 측정 시작 전: idle 구간에서 violation/reference 누적 차이 (NVML)
+    pv0_ns, pr0_ns = _nvml_power_violation_snapshot_ns(handle)
+    for i in range(pre_measure_samples):
+        if i < pre_measure_samples - 1:
+            time.sleep(interval_s)
+    pv1_ns, pr1_ns = _nvml_power_violation_snapshot_ns(handle)
+    power_violation_before_ns, reference_time_before_ns = _nvml_violation_delta_ns(
+        pv0_ns, pr0_ns, pv1_ns, pr1_ns)
+
+    _sampler_cmd_q.put("start")
+
+    time.sleep(MEASURE_PRE_MARGIN_S)
+
+    torch.cuda.synchronize()
+    pv_run0_ns, pr_run0_ns = _nvml_power_violation_snapshot_ns(handle)
     t0 = time.perf_counter()
 
     torch.cuda.cudart().cudaProfilerStart()
@@ -276,21 +402,208 @@ def measure(fn, num_iters, handle, sample_interval=0.1):
     torch.cuda.cudart().cudaProfilerStop()
 
     t1 = time.perf_counter()
+    pv_run1_ns, pr_run1_ns = _nvml_power_violation_snapshot_ns(handle)
+
+    time.sleep(MEASURE_POST_MARGIN_S)
+
     _sampler_cmd_q.put("stop")
 
     elapsed_ms = (t1 - t0) * 1000.0
 
+    power_violation_during_ns, reference_time_during_ns = _nvml_violation_delta_ns(
+        pv_run0_ns, pr_run0_ns, pv_run1_ns, pr_run1_ns)
+    power_violation_ratio = (
+        (power_violation_during_ns / reference_time_during_ns)
+        if reference_time_during_ns > 0 else 0.0)
+
     try:
-        power_samples, sm_samples, temp_samples = _sampler_result_q.get(timeout=5.0)
+        ts_samples, power_mw_samples, sm_samples, temp_samples = (
+            _sampler_result_q.get(timeout=5.0))
     except Exception:
-        power_samples, sm_samples, temp_samples = [], [], []
+        ts_samples, power_mw_samples, sm_samples, temp_samples = [], [], [], []
 
-    power_W    = sum(power_samples) / len(power_samples) if power_samples else 0.0
-    energy_mJ  = power_W * elapsed_ms
-    avg_sm_mhz = sum(sm_samples)    / len(sm_samples)    if sm_samples    else 0.0
-    avg_temp_c = sum(temp_samples)  / len(temp_samples)  if temp_samples  else 0.0
+    nvml_samples = []
+    n = min(
+        len(ts_samples), len(power_mw_samples), len(sm_samples), len(temp_samples))
+    t_off0 = ts_samples[0] if n else 0.0
+    for i in range(n):
+        pmw = power_mw_samples[i]
+        nvml_samples.append({
+            "sample_index": i,
+            "sample_time_ms": ts_samples[i] - t_off0,
+            "sample_power_mw": pmw,
+            "sample_power_w": pmw / 1000.0,
+            "sample_sm_clock_mhz": sm_samples[i],
+            "sample_temp_c": temp_samples[i],
+        })
 
-    return elapsed_ms, energy_mJ, power_W, avg_sm_mhz, avg_temp_c
+    # 기본: 전체 샘플 평균 (커널 구간 추출 실패 시)
+    power_W = (
+        (sum(power_mw_samples) / len(power_mw_samples) / 1000.0)
+        if power_mw_samples else 0.0)
+    avg_sm_mhz = (
+        sum(sm_samples) / len(sm_samples) if sm_samples else 0.0)
+    avg_temp_c = (
+        sum(temp_samples) / len(temp_samples) if temp_samples else 0.0)
+
+    # 커널 구간만 평균 (전후 margin 샘플 제외) — 요약 CSV·에너지와 커널 시간 정합
+    pre_ms = MEASURE_PRE_MARGIN_S * 1000.0
+    interval_ms = interval_s * 1000.0
+    tol_lo = max(40.0, interval_ms * 1.5)
+    tol_hi = max(100.0, interval_ms * 4.0)
+    lo_t = pre_ms - tol_lo
+    hi_t = pre_ms + elapsed_ms + tol_hi
+    ks = [
+        s for s in nvml_samples
+        if lo_t <= s["sample_time_ms"] <= hi_t
+    ]
+    if ks:
+        power_W = sum(s["sample_power_mw"] for s in ks) / len(ks) / 1000.0
+        avg_sm_mhz = sum(s["sample_sm_clock_mhz"] for s in ks) / len(ks)
+        avg_temp_c = sum(s["sample_temp_c"] for s in ks) / len(ks)
+
+    energy_mJ = power_W * elapsed_ms
+
+    return (
+        elapsed_ms,
+        energy_mJ,
+        power_W,
+        avg_sm_mhz,
+        avg_temp_c,
+        power_violation_before_ns,
+        reference_time_before_ns,
+        power_violation_during_ns,
+        reference_time_during_ns,
+        power_violation_ratio,
+        gpu_power_cap_w,
+        nvml_samples,
+    )
+
+
+# ── detail CSV (측정마다 즉시 기록; violation 컬럼 제외) ───────────────────────
+
+DETAIL_VIOLATION_KEYS = frozenset({
+    "power_violation_before_ns",
+    "reference_time_before_ns",
+    "power_violation_during_ns",
+    "reference_time_during_ns",
+    "power_violation_ratio",
+})
+
+DETAIL_CSV_COLUMNS = [
+    "measure_id",
+    "nvml_num_samples",
+    "sample_index",
+    "label",
+    "pid",
+    "test_case",
+    "batch_size",
+    "seq_len",
+    "layer",
+    "kernel",
+    "M",
+    "K",
+    "N",
+    "sleep_ns",
+    "sleep_freq",
+    "count",
+    "num_iters",
+    "elapsed_ms",
+    "gflops",
+    "energy_mj",
+    "nj_per_flop",
+    "sm_clock_mhz",
+    "temp_c",
+    "gpu_power_cap_w",
+    "sample_time_ms",
+    "sample_power_mw",
+    "sample_power_w",
+    "sample_sm_clock_mhz",
+    "sample_temp_c",
+]
+
+DETAIL_FLOAT_KEYS = frozenset({
+    "elapsed_ms", "gflops",
+    "energy_mj", "nj_per_flop", "sm_clock_mhz", "temp_c", "gpu_power_cap_w",
+    "sample_time_ms", "sample_power_w", "sample_sm_clock_mhz", "sample_temp_c",
+})
+
+
+class DetailCsvSink:
+    """measure() 1회마다 NVML 시계열 행을 detail CSV에 바로 쓰고 flush."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._f = open(path, "w", newline="")
+        self._w = csv.DictWriter(
+            self._f, fieldnames=DETAIL_CSV_COLUMNS, extrasaction="ignore")
+        self._w.writeheader()
+        self._f.flush()
+        self._measure_id = 0
+
+    def append_measurement(
+            self, rec: dict, run_label: str, test_case: str, pid: int) -> None:
+        self._measure_id += 1
+        mid = self._measure_id
+        base = {
+            k: v for k, v in rec.items()
+            if k != "_nvml_samples" and k not in DETAIL_VIOLATION_KEYS}
+        # detail에는 구간 평균 전력(power_w) 컬럼을 넣지 않음 — 샘플 열만 사용
+        pw_run_avg = float(base.pop("power_w", 0.0))
+        samples = rec.get("_nvml_samples") or []
+        n = len(samples)
+
+        def _round(row: dict) -> None:
+            for k in DETAIL_FLOAT_KEYS:
+                if k in row and isinstance(row[k], float):
+                    row[k] = round(row[k], 4)
+
+        if not samples:
+            row = {
+                **base,
+                "measure_id": mid,
+                "nvml_num_samples": 1,
+                "sample_index": 0,
+                "sample_time_ms": 0.0,
+                "sample_power_w": pw_run_avg,
+                "sample_power_mw": int(round(pw_run_avg * 1000)),
+                "sample_sm_clock_mhz": base.get("sm_clock_mhz", 0.0),
+                "sample_temp_c": base.get("temp_c", 0.0),
+                "label": run_label,
+                "pid": pid,
+                "test_case": test_case,
+            }
+            _round(row)
+            self._w.writerow(row)
+        else:
+            for s in samples:
+                row = {
+                    **base,
+                    **s,
+                    "measure_id": mid,
+                    "nvml_num_samples": n,
+                    "label": run_label,
+                    "pid": pid,
+                    "test_case": test_case,
+                }
+                _round(row)
+                self._w.writerow(row)
+        self._f.flush()
+
+    def close(self) -> None:
+        if getattr(self, "_f", None) is not None:
+            self._f.close()
+            self._f = None
+
+
+def commit_measure(
+        results_list, rec, detail_sink, args, test_case, pid):
+    """detail CSV 즉시 기록 후 메모리에서는 _nvml_samples 제거하여 results만 유지."""
+    run_label = (args.run_label.strip() or test_case)
+    if detail_sink is not None:
+        detail_sink.append_measurement(rec, run_label, test_case, pid)
+    results_list.append(
+        {k: v for k, v in rec.items() if k != "_nvml_samples"})
 
 
 def _sanitize_graph_filename(s: str) -> str:
@@ -446,6 +759,11 @@ def main():
         description="Qwen3-8B full-forward matmul benchmark with WMMA sleep")
     parser.add_argument("--device", type=int, default=3)
     parser.add_argument("--output-csv", default="logs/qwen3_8b_forward.csv")
+    parser.add_argument(
+        "--run-label",
+        default="",
+        help="실험 구분용 라벨; 비우면 test_case 문자열과 동일하게 기록됩니다.",
+    )
     parser.add_argument("--target-seconds", type=float, default=3.0,
                         help="Target wall-time per measurement point")
     # parser.add_argument("--warmup-iters", type=int, default=50*50*50)
@@ -459,7 +777,30 @@ def main():
         default="logs/cuda_graph_dump",
         help="CUDA Graph debug .dot 저장 디렉터리 (seq_len×batch_size별 하위 폴더)",
     )
+    parser.add_argument(
+        "--gpu-power-source",
+        choices=("nvml", "nvidia_smi_instant"),
+        default="nvml",
+        help=(
+            "detail 의 sample_power_* 전력 소스. nvml 은 nvmlDeviceGetPowerUsage 로 "
+            "드라이버가 짧게 평균·필터링한 값이라 power_limit 근처 스파이크가 "
+            "nvidia-smi power.draw.instant 로 찍은 gpu_power_log 보다 덜 튀어 보일 수 있다. "
+            "nvidia_smi_instant 은 동일 계열 값이지만 샘플마다 subprocess 비용이 있다."
+        ),
+    )
+    parser.add_argument(
+        "--nvml-interval",
+        type=float,
+        default=0.1,
+        help=(
+            "NVML 폴링 주기(초). 기본 0.1(100ms)은 드라이버 전력 갱신에 가깝고 "
+            "gpu_power_log/nvidia-smi 로그와 비슷한 시간 간격이다. "
+            "0.01처럼 매우 짧게 하면 같은 mW가 연속으로 반복되는 행이 많아질 수 있다 "
+            "(NVML 순간값도 하드웨어 해상도가 mW 정수이며 갱신 주기가 있다)."
+        ),
+    )
     args = parser.parse_args()
+    test_case = "FULL"
 
     torch.cuda.set_device(0)
 
@@ -517,18 +858,20 @@ def main():
               "python setup_bf16_sm90.py build_ext --inplace")
 
     pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(3)
+    handle = pynvml.nvmlDeviceGetHandleByIndex(args.device)
     device_name = pynvml.nvmlDeviceGetName(handle)
 
     # ── persistent sampler 프로세스 시작 (이후 measure() 가 재사용) ──────────
     try:
         dev_idx = pynvml.nvmlDeviceGetIndex(handle)
     except Exception:
-        dev_idx = 3
-    start_sampler(device_idx=dev_idx, interval=0.1)
+        dev_idx = int(args.device)
+    start_sampler(
+        device_idx=dev_idx,
+        interval=float(args.nvml_interval),
+        power_source=args.gpu_power_source,
+    )
     props = torch.cuda.get_device_properties(0)
-    # test_case = "LD+MMA"
-    test_case = "LD+ST"
     print(f"GPU        : {device_name}")
     print(f"SMs        : {props.multi_processor_count}")
     print(f"Model      : Qwen3-8B  ({NUM_LAYERS} layers)")
@@ -536,33 +879,57 @@ def main():
     print(f"Seq length : {args.seq_len}")
     print(f"Tokens (M) : {args.batch_size * args.seq_len}")
     print(f"Output     : {args.output_csv}")
+    print(f"Power samp.: {args.gpu_power_source} (--gpu-power-source)")
 
     # sleep_ns_list = [0] + [2 ** (i) for i in range(5, 19)]
     # sleep_ns_list = [2 * i for i in range(1, 200)]
-    # sleep_ns_list = [0, 8, 16, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288]
+    # sleep_ns_list = [0, 8, 16, 512, 1024, 4096, 8192, 16384, 32768]
     # sleep_ns_list = [0, 16, 32768, 131072]
-    sleep_ns_list   = [0]
+    # sleep_ns_list   = [0, 500, 1000, 1500, 2000, 2500]
+    # sleep_ns_list = [0, 100, 200, 300, 400 ,500 ,600 ,700, 800, 900, 1000, 1500, 2000]
+    # sleep_ns_list = [0, 200, 500, 600, 700, 800]
+    sleep_ns_list = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    # sleep_ns_list = [0, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
+    # sleep_ns_list = [140,141,142,143,144,145,146,147,148,149,150]
     # sleep_freq_list = [0, 1, 4, 16, 64, 256, 1024]
     sleep_freq_list = [32768, 16384, 8192, 4096, 2048, 1024, 256, 64, 16, 4, 1, 0]
     sleep_freq_list = [1024, 256, 64, 16, 4, 1, 0]
     # sleep_freq_list = [1, 2, 4]
     sleep_freq_list = [1]
     sleep_freq_list = [0]
-    clock_list = [2430, 2130, 1830, 1530, 1230, 930]
+    # clock_list = [2430, 2130, 1830, 1530, 1230, 930]
+    clock_list = [2430]
     # clock_list = [2430]
     # freq=0 : non-custom 커널만 동작 (custom_bf16 제외)
     # freq>0 : custom_bf16 만 동작 (sleep_freq_list 중 >0 인 값 순회)
 
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
     results = []
+    detail_sink = None
+    stem, _ext = os.path.splitext(args.output_csv)
+    detail_csv_path = f"{stem}_{pid}_detail.csv"
+    detail_sink = DetailCsvSink(detail_csv_path)
+    print(f"Detail CSV (streaming, NVML Δt={args.nvml_interval}s): {detail_csv_path}")
 
     # seq_len_list    = [1, 256, 512, 1024, 2048, 4096, 8192]
-    seq_len_list    = [256, 512, 1024, 2048, 4096, 8192]
-    # seq_len_list    = [256]
-    # seq_len_list    = [1]
-    batch_size_list = [16, 32, 64, 128, 512, 1024]
-    # batch_size_list = [16]
-    enable_persistence_mode = True
+    # seq_len_list    = [256, 512, 1024, 2048, 4096, 8192]
+    # seq_len_list    = [256, 8192]
+    # seq_len_list = [256]
+    # seq_len_list    = [8192, 1]
+    seq_len_list    = [8192]
+    # batch_size_list = [16, 32, 64, 128, 512, 1024]
+    batch_size_list = [16]
+    # batch_size_list = [16, 16, 16, 16, 16,16 ]
+    # batch_size_list = [8, 16, 32 ,64]
+
+    # for i in range(0, 16):
+    #     # if i % 4 == 0:
+    #     seq_len_list.append(8192)
+        # else:
+        #     seq_len_list.append(1)
+        # batch_size_list.append(16)
+    print(seq_len_list, batch_size_list)
+    enable_persistence_mode = False
     clock_changed = False
     persistence_mode = None
     try:
@@ -601,7 +968,7 @@ def main():
 
         for S in seq_len_list:
             for batch_sz in batch_size_list:
-                if batch_sz * S > 1024 * 512:
+                if batch_sz * S >= 1024 * 512:
                     print(f"  ⚠ Skipping B={batch_sz}, S={S} "
                           f"(tokens={batch_sz*S} > {1024*1024})")
                     continue
@@ -617,8 +984,12 @@ def main():
                     _tokens_scale  = _BASE_TOKENS / max(1, batch_sz * S)
                     _tokens_scale = 1
                     warmup_scaled  = max(1, int(args.warmup_iters * _tokens_scale))
+                    warmup_scaled = 0
                     ni_base        = max(1, int(50 * 50 * _tokens_scale))
-                    ni_base_kernel = max(1, int(50 * 50 * 1.2 * _tokens_scale))
+                    ni_base_kernel        = max(1, int(50 * 50 * _tokens_scale))
+                    ni_base = 50
+                    ni_base_kernel = 50
+                    # ni_base_kernel = max(1, int(50 * 50 * 1.2 * 20 * _tokens_scale))
                     # ni_base = 1
                     # ni_base_kernel = 1
                 else:
@@ -626,11 +997,19 @@ def main():
                     _tokens_scale  = _BASE_TOKENS / max(1, batch_sz * S)
                     _tokens_scale = 1
                     warmup_scaled  = max(1, int(1280000 * _tokens_scale))
+                    warmup_scaled = 0
                     ni_base        = max(1, int(128000 * _tokens_scale))
-                    ni_base_kernel = max(1, int(64 * 1000 * 3 * _tokens_scale))
+                    ni_base_kernel        = max(1, int(128000 * _tokens_scale))
+                    ni_base = 50
+                    ni_base_kernel = 50
+                    # ni_base_kernel = max(1, int(64 * 1000 * 3 * _tokens_scale))
                     # ni_base = 1
                     # ni_base_kernel = 1
-
+                warmup_scaled = 300
+                ni_base = 300
+                ni_base_kernel = 300
+                if S == 1:
+                    ni_base_kernel = 50 * 1000
                 print(f"\n{'#'*72}")
                 print(f"  Qwen3-8B prefill  B={batch_sz}  S={S}  tokens={batch_sz*S}  "
                       f"total={total_flops_fwd/1e9:.1f} GFLOP")
@@ -688,10 +1067,8 @@ def main():
                         # warmup_iters 만으로 부족할 때 이 루프가 보완한다.
                         # 최대 SM clock 의 90% 이상에 도달하거나 3초가 지나면 종료.
                         for clock in clock_list:
-                            print(1)
-                            set_specific_clock(handle, 0, clock, 3)
-                            print(2)
-                            clock_changed = True
+                            # set_specific_clock(handle, 0, clock, 3)
+                            # clock_changed = True
                             _burn_target_pct = 0.90
                             _burn_timeout_s  = 3.0
                             _burn_start      = time.time()
@@ -716,17 +1093,22 @@ def main():
 
                             # ── cuBLAS FP16 baseline ──
                             fn_cublas = lambda: torch.mm(A, B, out=C_fp16)
+                            ni = auto_iterations(fn_cublas, args.target_seconds)
+                            # warmup_scaled = int(ni * 0.5)
+                            warmup_scaled = 0
+                            ni = 100
                             for _ in range(warmup_scaled):
                                 fn_cublas()
-                            ni = auto_iterations(fn_cublas, args.target_seconds)
-                            ni = ni_base
+                            # ni = auto_iterations(fn_cublas, args.target_seconds)
+                            # ni = ni_base
                             _cg_fp16 = cuda_graph_dot_path(
                                 args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_fp16")
                             cuda_graph_capture_debug_dump(fn_cublas, _cg_fp16)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                                 torch.cuda.nvtx.range_push(f"{tag} cuBLAS sleep=0ns")
-                            el, en, pw, sm_clk, temp = measure(fn_cublas, ni, handle)
+                            el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
+                                fn_cublas, ni, handle, sample_interval=args.nvml_interval)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                                 torch.cuda.nvtx.range_pop()
@@ -734,20 +1116,30 @@ def main():
                             nj = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
                             print(f"  {'cuBLAS':14s} | sleep=     0ns freq=   0  iters={ni:5d} | "
                                 f"{el:8.1f}ms {gf:8.1f}GF {pw:6.1f}W "
-                                f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C")
-                            results.append(dict(
+                                f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C"
+                                f"  PVpre={pv_bef}ns/{ref_bef}ns"
+                                f"  PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
+                            rec = dict(
                                 batch_size=batch_sz, seq_len=S,
                                 layer=name, count=count,
                                 M=M, K=K, N=N, kernel="cublas",
                                 sleep_ns=0, sleep_freq=0, num_iters=ni,
                                 elapsed_ms=el, gflops=gf, power_w=pw,
                                 energy_mj=en, nj_per_flop=nj, sm_clock_mhz=sm_clk,
-                                temp_c=temp))
-
+                                temp_c=temp,
+                                gpu_power_cap_w=gpu_power_cap_w,
+                                power_violation_before_ns=pv_bef,
+                                reference_time_before_ns=ref_bef,
+                                power_violation_during_ns=pv_dur,
+                                reference_time_during_ns=ref_dur,
+                                power_violation_ratio=pv_rat,
+                                _nvml_samples=nvml_samples)
+                            commit_measure(results, rec, detail_sink, args, test_case, pid)
+                            time.sleep(1)
                             # ── cuBLAS BF16 baseline ──
                             fn_cublas_bf16 = lambda: torch.mm(A_bf16, B_bf16, out=C_bf16)
-                            for _ in range(warmup_scaled):
-                                fn_cublas_bf16()
+                            # for _ in range(warmup_scaled):
+                            #     fn_cublas_bf16()
                             ni_bf16 = auto_iterations(fn_cublas_bf16, args.target_seconds)
                             ni_bf16 = ni_base
                             _cg_bf16 = cuda_graph_dot_path(
@@ -756,23 +1148,31 @@ def main():
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                                 torch.cuda.nvtx.range_push(f"{tag} cuBLAS_BF16 sleep=0ns")
-                            el_b, en_b, pw_b, sm_clk_b, temp_b = measure(fn_cublas_bf16, ni_bf16, handle)
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.nvtx.range_pop()
-                            gf_b = flops_per_gemm * ni_bf16 / (el_b / 1000) / 1e9
-                            nj_b = en_b * 1e6 / (flops_per_gemm * ni_bf16) if ni_bf16 > 0 else 0
-                            print(f"  {'cuBLAS_BF16':14s} | sleep=     0ns freq=   0  iters={ni_bf16:5d} | "
-                                f"{el_b:8.1f}ms {gf_b:8.1f}GF {pw_b:6.1f}W "
-                                f"{en_b:8.0f}mJ {nj_b:.3f}nJ/F  SM={sm_clk_b:.0f}MHz  T={temp_b:.0f}°C")
-                            results.append(dict(
-                                batch_size=batch_sz, seq_len=S,
-                                layer=name, count=count,
-                                M=M, K=K, N=N, kernel="cublas_bf16",
-                                sleep_ns=0, sleep_freq=0, num_iters=ni_bf16,
-                                elapsed_ms=el_b, gflops=gf_b, power_w=pw_b,
-                                energy_mj=en_b, nj_per_flop=nj_b, sm_clock_mhz=sm_clk_b,
-                                temp_c=temp_b))
+                            # el_b, en_b, pw_b, sm_clk_b, temp_b, pv_bef_b, ref_bef_b, pv_dur_b, ref_dur_b, pv_rat_b = measure(
+                            #     fn_cublas_bf16, ni_bf16, handle)
+                            # if torch.cuda.is_available():
+                            #     torch.cuda.synchronize()
+                            #     torch.cuda.nvtx.range_pop()
+                            # gf_b = flops_per_gemm * ni_bf16 / (el_b / 1000) / 1e9
+                            # nj_b = en_b * 1e6 / (flops_per_gemm * ni_bf16) if ni_bf16 > 0 else 0
+                            # print(f"  {'cuBLAS_BF16':14s} | sleep=     0ns freq=   0  iters={ni_bf16:5d} | "
+                            #     f"{el_b:8.1f}ms {gf_b:8.1f}GF {pw_b:6.1f}W "
+                            #     f"{en_b:8.0f}mJ {nj_b:.3f}nJ/F  SM={sm_clk_b:.0f}MHz  T={temp_b:.0f}°C"
+                            #     f"  PVpre={pv_bef_b}ns/{ref_bef_b}ns"
+                            #     f"  PVrun={pv_dur_b}ns/{ref_dur_b}ns ({pv_rat_b * 100:.1f}% NVML ref)")
+                            # results.append(dict(
+                            #     batch_size=batch_sz, seq_len=S,
+                            #     layer=name, count=count,
+                            #     M=M, K=K, N=N, kernel="cublas_bf16",
+                            #     sleep_ns=0, sleep_freq=0, num_iters=ni_bf16,
+                            #     elapsed_ms=el_b, gflops=gf_b, power_w=pw_b,
+                            #     energy_mj=en_b, nj_per_flop=nj_b, sm_clock_mhz=sm_clk_b,
+                            #     temp_c=temp_b,
+                            #     power_violation_before_ns=pv_bef_b,
+                            #     reference_time_before_ns=ref_bef_b,
+                            #     power_violation_during_ns=pv_dur_b,
+                            #     reference_time_during_ns=ref_dur_b,
+                            #     power_violation_ratio=pv_rat_b))
 
                             # ── wmma_gemm_sleep_kernel sweep ──
                             # WMMA kernel outputs FP32 → check if output fits in GPU memory
@@ -919,7 +1319,7 @@ def main():
 
                             # cuBLAS baseline: sleep 없음
                             gf_cublas = gf  # 앞서 측정한 cuBLAS GFLOP/s (비율 계산용)
-
+                            # gf_cublas = 100
                             for kname, kfn, has_sleep in kernel_sweep:
                                 sns_iter = sleep_ns_list
                                 for sns in sns_iter:
@@ -930,11 +1330,15 @@ def main():
                                         else:
                                             continue
                                         fn = lambda _s=sns, _f=sfreq: kfn(_s, _f)
+                                        ni = auto_iterations(fn, args.target_seconds)
+                                        # warmup_scaled = int(ni * 0.5)
+                                        warmup_scaled = 0
+                                        ni = 100
                                         for _ in range(warmup_scaled):
                                             fn()
 
-                                        ni = auto_iterations(fn, args.target_seconds)
-                                        ni = ni_base_kernel
+                                        # ni = auto_iterations(fn, args.target_seconds)
+                                        # ni = ni_base_kernel
                                         _cg_k = cuda_graph_dot_path(
                                             args.cuda_graph_dump_dir,
                                             batch_sz, S, name, kname,
@@ -944,7 +1348,8 @@ def main():
                                             torch.cuda.synchronize()
                                             torch.cuda.nvtx.range_push(
                                                 f"{tag} {kname} sleep={sns}ns freq={sfreq}")
-                                        el, en, pw, sm_clk, temp = measure(fn, ni, handle)
+                                        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
+                                            fn, ni, handle, sample_interval=args.nvml_interval)
                                         if torch.cuda.is_available():
                                             torch.cuda.synchronize()
                                             torch.cuda.nvtx.range_pop()
@@ -956,98 +1361,200 @@ def main():
                                             f"{el:8.1f}ms {gf_k:8.1f}GF {pw:6.1f}W "
                                             f"{en:8.0f}mJ {nj_k:.3f}nJ/F  "
                                             f"SM={sm_clk:.0f}MHz  T={temp:.0f}°C  "
+                                            f"PVpre={pv_bef}ns/{ref_bef}ns "
+                                            f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)  "
                                             f"[vs cuBLAS: {ratio:.2f}×]")
-                                        results.append(dict(
+                                        rec = dict(
                                             batch_size=batch_sz, seq_len=S,
                                             layer=name, count=count,
                                             M=M, K=K, N=N, kernel=kname,
                                             sleep_ns=sns, sleep_freq=sfreq, num_iters=ni,
                                             elapsed_ms=el, gflops=gf_k, power_w=pw,
                                             energy_mj=en, nj_per_flop=nj_k,
-                                            sm_clock_mhz=sm_clk, temp_c=temp))
-
-                    # ───────────────────────────────────────────
+                                            sm_clock_mhz=sm_clk, temp_c=temp,
+                                            gpu_power_cap_w=gpu_power_cap_w,
+                                            power_violation_before_ns=pv_bef,
+                                            reference_time_before_ns=ref_bef,
+                                            power_violation_during_ns=pv_dur,
+                                            reference_time_during_ns=ref_dur,
+                                            power_violation_ratio=pv_rat,
+                                            _nvml_samples=nvml_samples)
+                                        commit_measure(results, rec, detail_sink, args, test_case, pid)
+                                    
+                                        time.sleep(1)
                     #  Full-forward estimate  (aggregate per sleep_ns)
                     # ───────────────────────────────────────────
-                print(f"\n{'='*72}")
-                print(f"  Full-forward estimate  (B={batch_sz}, S={S})")
-                print(f"{'='*72}")
-                print(f"  {'kernel':14s} | {'sleep_ns':>8s} {'freq':>5s} | "
-                    f"{'time_ms':>9s} {'power_W':>8s} {'energy_mJ':>10s} "
-                    f"{'GFLOPS':>8s} {'nJ/FLOP':>8s} {'SM_MHz':>8s} {'Temp_C':>7s}")
+                # print(f"\n{'='*72}")
+                # print(f"  Full-forward estimate  (B={batch_sz}, S={S})")
+                # print(f"{'='*72}")
+                # print(f"  {'kernel':14s} | {'sleep_ns':>8s} {'freq':>5s} | "
+                #     f"{'time_ms':>9s} {'power_W':>8s} {'energy_mJ':>10s} "
+                #     f"{'GFLOPS':>8s} {'nJ/FLOP':>8s} {'SM_MHz':>8s} {'Temp_C':>7s}")
 
-                all_kernels = (
-                    [(0, 0, "cublas")]
-                    + [(0, 0, "cublas_bf16")]
-                    + [(0, 0, "cutlass_sm90")]  # CUTLASS 3.x wgmma+TMA (SM90/SM120)
-                    + [(0, 0, "ptx_sm80")]     # PTX inline-asm SM80 kernel
-                    + [(0, 0, "fp8_tcgen05")]
-                    + [(0, 0, "wmma_opt")]     # freq=0 고정 (non-custom)
-                    # cutlass_sm80: sleep_ns × (freq>0) 전체 조합 (CUTLASS_SLEEP_ENABLED)
-                    + [(s, f, "cutlass_sm80")
-                    for s in sleep_ns_list
-                    for f in sleep_freq_list if f > 0]
-                    # bf16_custom: sleep_ns × (freq>0) 전체 조합
-                    + [(s, f, "bf16_custom")
-                    for s in sleep_ns_list
-                    for f in sleep_freq_list if f > 0]
-                )
-                for sns, sfreq, kern in all_kernels:
+                # all_kernels = (
+                #     [(0, 0, "cublas")]
+                #     + [(0, 0, "cublas_bf16")]
+                #     + [(0, 0, "cutlass_sm90")]  # CUTLASS 3.x wgmma+TMA (SM90/SM120)
+                #     + [(0, 0, "ptx_sm80")]     # PTX inline-asm SM80 kernel
+                #     + [(0, 0, "fp8_tcgen05")]
+                #     + [(0, 0, "wmma_opt")]     # freq=0 고정 (non-custom)
+                #     # cutlass_sm80: sleep_ns × (freq>0) 전체 조합 (CUTLASS_SLEEP_ENABLED)
+                #     + [(s, f, "cutlass_sm80")
+                #     for s in sleep_ns_list
+                #     for f in sleep_freq_list if f > 0]
+                #     # bf16_custom: sleep_ns × (freq>0) 전체 조합
+                #     + [(s, f, "bf16_custom")
+                #     for s in sleep_ns_list
+                #     for f in sleep_freq_list if f > 0]
+                # )
+                # for sns, sfreq, kern in all_kernels:
 
-                    matched = [r for r in results
-                            if r["kernel"] == kern
-                            and r["sleep_ns"] == sns
-                            and r["sleep_freq"] == sfreq]
-                    if not matched:
-                        continue
+                #     matched = [r for r in results
+                #             if r["kernel"] == kern
+                #             and r["sleep_ns"] == sns
+                #             and r["sleep_freq"] == sfreq]
+                #     if not matched:
+                #         continue
 
-                    fwd_time_ms   = 0.0
-                    fwd_energy_mj = 0.0
-                    # SM clock & temperature: 측정 시간 가중 평균 (elapsed_ms 비례)
-                    sm_clk_sum    = 0.0
-                    temp_sum      = 0.0
-                    weight_sum    = 0.0
-                    for r in matched:
-                        per_op_ms = r["elapsed_ms"] / r["num_iters"]
-                        per_op_mj = r["energy_mj"] / r["num_iters"]
-                        w = per_op_ms * r["count"]
-                        fwd_time_ms   += w
-                        fwd_energy_mj += per_op_mj * r["count"]
-                        sm_clk_sum    += r.get("sm_clock_mhz", 0.0) * w
-                        temp_sum      += r.get("temp_c", 0.0) * w
-                        weight_sum    += w
+                #     fwd_time_ms   = 0.0
+                #     fwd_energy_mj = 0.0
+                #     # SM clock & temperature: 측정 시간 가중 평균 (elapsed_ms 비례)
+                #     sm_clk_sum    = 0.0
+                #     temp_sum      = 0.0
+                #     weight_sum    = 0.0
+                #     for r in matched:
+                #         per_op_ms = r["elapsed_ms"] / r["num_iters"]
+                #         per_op_mj = r["energy_mj"] / r["num_iters"]
+                #         w = per_op_ms * r["count"]
+                #         fwd_time_ms   += w
+                #         fwd_energy_mj += per_op_mj * r["count"]
+                #         sm_clk_sum    += r.get("sm_clock_mhz", 0.0) * w
+                #         temp_sum      += r.get("temp_c", 0.0) * w
+                #         weight_sum    += w
 
-                    fwd_power  = fwd_energy_mj / fwd_time_ms if fwd_time_ms > 0 else 0
-                    fwd_gflops = total_flops_fwd / (fwd_time_ms / 1000) / 1e9 \
-                        if fwd_time_ms > 0 else 0
-                    fwd_nj     = fwd_energy_mj * 1e6 / total_flops_fwd \
-                        if total_flops_fwd > 0 else 0
-                    fwd_sm_mhz = sm_clk_sum / weight_sum if weight_sum > 0 else 0
-                    fwd_temp_c = temp_sum   / weight_sum if weight_sum > 0 else 0
+                #     fwd_power  = fwd_energy_mj / fwd_time_ms if fwd_time_ms > 0 else 0
+                #     fwd_gflops = total_flops_fwd / (fwd_time_ms / 1000) / 1e9 \
+                #         if fwd_time_ms > 0 else 0
+                #     fwd_nj     = fwd_energy_mj * 1e6 / total_flops_fwd \
+                #         if total_flops_fwd > 0 else 0
+                #     fwd_sm_mhz = sm_clk_sum / weight_sum if weight_sum > 0 else 0
+                #     fwd_temp_c = temp_sum   / weight_sum if weight_sum > 0 else 0
 
-                    print(f"  {kern:14s} | {sns:8d} {sfreq:5d} | {fwd_time_ms:9.3f} "
-                        f"{fwd_power:8.1f} {fwd_energy_mj:10.1f} {fwd_gflops:8.1f} "
-                        f"{fwd_nj:8.4f} {fwd_sm_mhz:8.0f} {fwd_temp_c:7.1f}")
+                #     print(f"  {kern:14s} | {sns:8d} {sfreq:5d} | {fwd_time_ms:9.3f} "
+                #         f"{fwd_power:8.1f} {fwd_energy_mj:10.1f} {fwd_gflops:8.1f} "
+                #         f"{fwd_nj:8.4f} {fwd_sm_mhz:8.0f} {fwd_temp_c:7.1f}")
 
         # ═══════════════════════════════════════════════════════════
-        #  Write CSV
+        #  Summary CSV (detail 은 측정마다 detail_csv_path 에 즉시 기록됨)
         # ═══════════════════════════════════════════════════════════
         if results:
-            fieldnames = list(results[0].keys()) + ["test_case"]
-            
-            args.output_csv = args.output_csv.replace(".csv", f"_{pid}.csv")
-            with open(args.output_csv, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=fieldnames)
+            run_label = (args.run_label.strip() or test_case)
+
+            summary_csv = f"{stem}_{pid}_summary.csv"
+
+            # ── 요약: (batch, seq, kernel, sleep_ns, sleep_freq) 별 full-forward 스타일 집계 ──
+            grp = defaultdict(list)
+            for r in results:
+                key = (
+                    r["batch_size"],
+                    r["seq_len"],
+                    r["kernel"],
+                    r["sleep_ns"],
+                    r["sleep_freq"],
+                )
+                grp[key].append(r)
+
+            summary_rows = []
+            for key in sorted(grp.keys()):
+                rows = grp[key]
+                batch_size, seq_len, kernel, sleep_ns, sleep_freq = key
+                fwd_time_ms = sum(
+                    (row["elapsed_ms"] / max(1, row["num_iters"])) * row["count"]
+                    for row in rows)
+                fwd_energy_mj = sum(
+                    (row["energy_mj"] / max(1, row["num_iters"])) * row["count"]
+                    for row in rows)
+                weight_sum = sum(
+                    (row["elapsed_ms"] / max(1, row["num_iters"])) * row["count"]
+                    for row in rows)
+                sm_clk_sum = sum(
+                    row.get("sm_clock_mhz", 0.0)
+                    * (row["elapsed_ms"] / max(1, row["num_iters"])) * row["count"]
+                    for row in rows)
+                temp_sum = sum(
+                    row.get("temp_c", 0.0)
+                    * (row["elapsed_ms"] / max(1, row["num_iters"])) * row["count"]
+                    for row in rows)
+                total_flops = sum(
+                    2.0 * row["M"] * row["K"] * row["N"] * row["count"]
+                    for row in rows)
+                fwd_power_w = (
+                    fwd_energy_mj / fwd_time_ms if fwd_time_ms > 0 else 0.0)
+                fwd_gflops = (
+                    total_flops / (fwd_time_ms / 1000.0) / 1e9
+                    if fwd_time_ms > 0 else 0.0)
+                fwd_nj = (
+                    fwd_energy_mj * 1e6 / total_flops if total_flops > 0 else 0.0)
+                fwd_sm_mhz = sm_clk_sum / weight_sum if weight_sum > 0 else 0.0
+                fwd_temp_c = temp_sum / weight_sum if weight_sum > 0 else 0.0
+
+                summary_rows.append({
+                    "label": run_label,
+                    "pid": pid,
+                    "test_case": test_case,
+                    "batch_size": batch_size,
+                    "seq_len": seq_len,
+                    "kernel": kernel,
+                    "sleep_ns": sleep_ns,
+                    "sleep_freq": sleep_freq,
+                    "layer_rows": len(rows),
+                    "fwd_time_ms": round(fwd_time_ms, 4),
+                    "fwd_energy_mj": round(fwd_energy_mj, 4),
+                    "fwd_power_w": round(fwd_power_w, 4),
+                    "fwd_gflops": round(fwd_gflops, 4),
+                    "fwd_nj_per_flop": round(fwd_nj, 4),
+                    "total_flops_fwd": round(total_flops, 2),
+                    "fwd_sm_mhz": round(fwd_sm_mhz, 4),
+                    "fwd_temp_c": round(fwd_temp_c, 4),
+                })
+
+            summary_fields = [
+                "label", "pid", "test_case",
+                "batch_size", "seq_len", "kernel", "sleep_ns", "sleep_freq",
+                "layer_rows",
+                "fwd_time_ms", "fwd_energy_mj", "fwd_power_w",
+                "fwd_gflops", "fwd_nj_per_flop", "total_flops_fwd",
+                "fwd_sm_mhz", "fwd_temp_c",
+            ]
+            with open(summary_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=summary_fields)
                 w.writeheader()
-                for r in results:
-                    for k in ("elapsed_ms", "gflops", "power_w",
-                            "energy_mj", "nj_per_flop", "sm_clock_mhz", "temp_c"):
-                        if isinstance(r[k], float):
-                            r[k] = round(r[k], 4)
-                    r["test_case"] = test_case
-                    w.writerow(r)
-            print(f"\n✅ Results saved to {args.output_csv}")
+                for sr in summary_rows:
+                    w.writerow(sr)
+
+            print(f"\n✅ Detail (streaming NVML, label={run_label!r}) → {detail_csv_path}")
+            print(f"✅ Summary (aggregated)                  → {summary_csv}")
     finally:
+        if detail_sink is not None:
+            detail_sink.close()
+        # Detail CSV 가 모두 디스크에 반영된 뒤 자동 플롯 (벤치와 동일한 python)
+        _custum_dir = os.path.dirname(os.path.abspath(__file__))
+        _plot_script = os.path.join(_custum_dir, "plot_detail_csv.py")
+        if (
+            results
+            and detail_csv_path
+            and os.path.isfile(detail_csv_path)
+            and os.path.isfile(_plot_script)
+        ):
+            _png = os.path.splitext(detail_csv_path)[0] + "_plot.png"
+            try:
+                subprocess.run(
+                    [sys.executable, _plot_script, detail_csv_path, "-o", _png],
+                    check=False,
+                    timeout=180,
+                )
+            except Exception as e:
+                print(f"⚠ plot_detail_csv 자동 실행 실패: {e}")
         stop_sampler()       # sampler 프로세스 정상 종료
         if clock_changed:
             print("\n1. Resetting GPU Locked Clocks...", end=" ")

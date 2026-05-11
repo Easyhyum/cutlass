@@ -2,9 +2,9 @@ ninja_required_version = 1.3
 cxx = c++
 nvcc = /usr/local/cuda/bin/nvcc
 
-cflags = -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -I/workspace/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c
+cflags = -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -DCUTLASS_MMA_MAC_LOOP_TIMING=1 -I/workspace/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c
 post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=bf16_gemm_sm80 -std=c++17
-cuda_cflags = -I/workspace/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c
+cuda_cflags = -DCUTLASS_MMA_MAC_LOOP_TIMING=1 -I/workspace/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c
 cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -arch=sm_120 -O3 --use_fast_math -lineinfo --expt-relaxed-constexpr -DCUTLASS_SLEEP_ENABLED -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=bf16_gemm_sm80 -std=c++17
 cuda_dlink_post_cflags = 
 sycl_dlink_post_cflags = 
