@@ -508,9 +508,22 @@ public:
     FragmentC &accum,               ///< [in|out] destination accumulator tile
     IteratorA &iterator_A,          ///< [in|out] iterator over A operand in global memory
     IteratorB &iterator_B,          ///< [in|out] iterator over B operand in global memory
-    int &gemm_k_iterations)         ///< [in|out] number of threadblock mainloop iterations remaining
+    int &gemm_k_iterations)
+    // unsigned int warp_in_cta,
+    // unsigned int smid,
+    // unsigned int k_gemm_outer_iter)         ///< [in|out] number of threadblock mainloop iterations remaining
   {
+
+    // bool ascend_flag = k_gemm_outer_iter % 2 == 0 ? true : false;
     // Unroll the warp-level MMA tiles of a threadblock's mainloop iteration
+    // #ifdef CUTLASS_SLEEP_ENABLED
+    // // if (warp_mma_k == 0 && gemm_k_iterations > Base::kStages && gemm_k_iterations % 2 == warp_in_cta % 2) {
+    // // if (kCutlassSleepNs != 0 && warp_mma_k == 0 && gemm_k_iterations > 20 && smid % 2  == gemm_k_iterations % 2) {
+    // if ((smid ^ gemm_k_iterations) & 1u) {
+    //     __nanosleep(kCutlassSleepNs);
+    // }
+    // #endif
+
     CUTLASS_PRAGMA_UNROLL
     for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations; ++warp_mma_k) {
 
@@ -695,25 +708,36 @@ public:
     }
 
     // Outer mainloop iteration counter (for optional debug / timing hooks)
-    // int k_gemm_outer_iter = 0;
-
-#ifdef CUTLASS_SLEEP_ENABLED
-    if (kCutlassSleepNs > 0u && gemm_k_iterations > Base::kStages) {
-      // One-time phase offset for compute-bound kernels. This staggers CTA/warp
-      // entry into the mainloop without perturbing the inner MMA pipeline.
-      unsigned int const phase = (smid + warp_in_cta) % 10u;
-      unsigned long long const phase_cycles =
-          static_cast<unsigned long long>(phase) * kCutlassSleepNs;
-      unsigned long long const __mma_t0 = clock64();
-      while ((clock64() - __mma_t0) < phase_cycles) {
-        // intentional phase offset
-      }
-    }
-#endif
+    // unsigned int k_gemm_outer_iter = 0;
+    // int gemm_k_iterations_original = gemm_k_iterations;
+    // int start_sleep_iter = k_gemm_outer_iter + gemm_k_iterations_original * 0.1;
+// #ifdef CUTLASS_SLEEP_ENABLED
+//     if (kCutlassSleepNs > 0u && gemm_k_iterations > Base::kStages) {
+//       unsigned int const phase = (smid + warp_in_cta) % 10u;
+//       unsigned long long const phase_cycles =
+//           static_cast<unsigned long long>(phase) * kCutlassSleepNs;
+//       unsigned long long const __mma_t0 = clock64();
+//       while ((clock64() - __mma_t0) < phase_cycles) {
+//         // intentional phase offset
+//       }
+//     }
+// #endif
 
     // Mainloop
     CUTLASS_GEMM_LOOP
     for (; gemm_k_iterations > (-Base::kStages + 1);) {
+        // #ifdef CUTLASS_SLEEP_ENABLED
+        // if (k_gemm_outer_iter >= start_sleep_iter && gemm_k_iterations > Base::kStages && k_gemm_outer_iter % 8 == warp_in_cta % 8) {
+        //   __nanosleep(kCutlassSleepNs);
+        //     // if (kCutlassSleepNs > 0u) {
+        //     //   unsigned long long const __mma_t0 = clock64();
+        //     //   while ((clock64() - __mma_t0) < kCutlassSleepNs) {
+        //     //     // intentional busy wait
+        //     //   }
+        //     // }
+          
+        // }
+        // #endif
 // #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
 //       if (k_gemm_outer_iter == 0) {
 //         unsigned int const tid =
@@ -746,29 +770,29 @@ public:
 //         }
 //       }
 // #endif
+    #ifdef CUTLASS_SLEEP_ENABLED
+    // if (warp_mma_k == 0 && gemm_k_iterations > Base::kStages && gemm_k_iterations % 2 == warp_in_cta % 2) {
+    // if (kCutlassSleepNs != 0 && warp_mma_k == 0 && gemm_k_iterations > 20 && smid % 2  == gemm_k_iterations % 2) {
+    if ((smid ^ gemm_k_iterations) & 1u) {
+        __nanosleep(kCutlassSleepNs);
+    }
+    #endif
       mac_loop_iter(
         pipe_state,
         accum,
         iterator_A,
         iterator_B,
         gemm_k_iterations);
-      // ++k_gemm_outer_iter;
+        // warp_in_cta,
+        // smid,
+        // k_gemm_outer_iter);
     }
 
     if (Detail::kStagedAccumulation) {
       plus<FragmentC> plus_accum;
       accum = plus_accum(accum, pipe_state.tmp_accum_);
     }
-    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
-    //       unsigned long long start = clock64();
-    
-    //       while ((clock64() - start) < kCutlassSleepNs) {
-    //           // intentional busy wait
-    //       }
-    // }
-    // if (kCutlassSleepNs > 0u && kCutlassSleepFreq > 0u) {
-    //     __nanosleep(kCutlassSleepNs);
-    // }
+
     // Commit and drain all pending and predicated cp.async pnz from the GEMM mainloop
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();

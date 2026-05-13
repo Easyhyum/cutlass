@@ -205,7 +205,7 @@ def _sdpa_flash(q, k, v):
 
 
 def make_qwen3_kernel_forward_fn(B, S, matmul_kernel, sleep_ns, sleep_freq,
-                                 cutlass_sm80):
+                                 cutlass_sm80, persistent_sm80, args):
     """Actual CUDA forward kernel sequence for Qwen3-8B block stack.
 
     This uses synthetic weights/activations but executes the forward kernels in
@@ -238,6 +238,15 @@ def make_qwen3_kernel_forward_fn(B, S, matmul_kernel, sleep_ns, sleep_freq,
             return cutlass_sm80.gemm_sm80_v3(
                 a.contiguous(), b.contiguous(),
                 sleep_ns=sleep_ns, sleep_freq=sleep_freq)
+        if matmul_kernel == "persistent_cta":
+            if persistent_sm80 is None:
+                raise RuntimeError("bf16_gemm_sm80_persistent module is not available")
+            return persistent_sm80.gemm_sm80_persistent(
+                a.contiguous(), b.contiguous(),
+                sleep_ns, sleep_freq,
+                args.persistent_throttle_mode,
+                args.persistent_ctas_per_sm,
+                args.persistent_chunk_tiles)
         raise ValueError(f"unknown matmul kernel: {matmul_kernel}")
 
     def _forward_once():
@@ -268,12 +277,34 @@ def qwen3_forward_kernel_flops(B, S, include_lm_head=False):
         B, S, num_layers=ACTUAL_FORWARD_LAYERS)
 
 
+def _fmt_ratio(v, base):
+    return f"{(v / base):.2f}×" if base and base > 0 else "n/a"
+
+
+def _fmt_sm_delta(v, base):
+    if not base or base <= 0:
+        return "n/a"
+    return f"{(v / base):.2f}×, Δ{(v - base):+.0f}MHz"
+
+
+def _cutlass_cmp_parts(gflops, sm_clock_mhz, cutlass_ref, label):
+    if cutlass_ref is None:
+        return []
+    return [
+        f"vs {label}: {_fmt_ratio(gflops, cutlass_ref['gflops'])}",
+        f"SM/{label}: {_fmt_sm_delta(sm_clock_mhz, cutlass_ref['sm_clock_mhz'])}",
+    ]
+
+
 def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
-                                 cutlass_sm80, handle, args):
+                                 cutlass_sm80, persistent_sm80, handle, args,
+                                 cmp_parts=None):
     """Measure an actual synthetic Qwen3-8B forward kernel sequence."""
     try:
+        cmp_parts = cmp_parts or []
         fn = make_qwen3_kernel_forward_fn(
-            B, S, matmul_kernel, sleep_ns, sleep_freq, cutlass_sm80)
+            B, S, matmul_kernel, sleep_ns, sleep_freq,
+            cutlass_sm80, persistent_sm80, args)
         # Warmup once to pay allocator/kernel selection cost outside measurement.
         fn()
         torch.cuda.synchronize()
@@ -288,7 +319,8 @@ def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
             f"sleep={sleep_ns:6d}ns freq={sleep_freq:4d} iters={ni:3d} | "
             f"{el:8.1f}ms {gflops:8.1f}GF {pw:6.1f}W "
             f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C "
-            f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
+            f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)"
+            f"{'  [' + ' | '.join(cmp_parts) + ']' if cmp_parts else ''}")
         return {
             "batch_size": B,
             "seq_len": S,
@@ -315,6 +347,134 @@ def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
     except Exception as e:
         print(
             f"  ⚠ actual forward skipped: kernel={matmul_kernel} "
+            f"sleep={sleep_ns} freq={sleep_freq}: {e}")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return None
+
+
+def qwen3_mlp_graph_flops(B, S, num_layers=ACTUAL_FORWARD_LAYERS):
+    """FLOPs for (mlp_up -> mlp_gate -> mlp_down) repeated num_layers times."""
+    bs = ((B * S + 15) // 16) * 16
+    return 3.0 * 2.0 * bs * HIDDEN * INTER * num_layers
+
+
+def make_qwen3_mlp_graph_replay_fn(B, S, matmul_kernel, sleep_ns, sleep_freq,
+                                   cutlass_sm80, persistent_sm80, args):
+    """Capture (mlp_up -> mlp_gate -> mlp_down) x ACTUAL_FORWARD_LAYERS as one CUDA Graph."""
+    BS = ((B * S + 15) // 16) * 16
+    hidden = torch.randn(BS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    weights = {
+        "up": torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.bfloat16),
+        "gate": torch.randn(HIDDEN, INTER, device="cuda", dtype=torch.bfloat16),
+        "down": torch.randn(INTER, HIDDEN, device="cuda", dtype=torch.bfloat16),
+    }
+
+    def _mm(a, b):
+        if matmul_kernel == "cublas":
+            return torch.mm(a, b)
+        if matmul_kernel == "cutlass_sm80":
+            if cutlass_sm80 is None:
+                raise RuntimeError("cutlass_sm80 module is not available")
+            return cutlass_sm80.gemm_sm80_v3(
+                a.contiguous(), b.contiguous(),
+                sleep_ns=sleep_ns, sleep_freq=sleep_freq)
+        if matmul_kernel == "persistent_cta":
+            if persistent_sm80 is None:
+                raise RuntimeError("bf16_gemm_sm80_persistent module is not available")
+            return persistent_sm80.gemm_sm80_persistent(
+                a.contiguous(), b.contiguous(),
+                sleep_ns, sleep_freq,
+                args.persistent_throttle_mode,
+                args.persistent_ctas_per_sm,
+                args.persistent_chunk_tiles)
+        raise ValueError(f"unknown matmul kernel: {matmul_kernel}")
+
+    def _body():
+        x = hidden
+        for _ in range(ACTUAL_FORWARD_LAYERS):
+            up = _mm(x, weights["up"])
+            _ = _mm(x, weights["gate"])
+            x = _mm(up, weights["down"])
+        return x
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(1):
+            _body()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _body()
+    torch.cuda.synchronize()
+
+    static_refs = (hidden, weights)
+
+    def _replay():
+        _ = static_refs
+        graph.replay()
+
+    return _replay
+
+
+def measure_qwen3_mlp_graph_replay(B, S, matmul_kernel, sleep_ns, sleep_freq,
+                                   cutlass_sm80, persistent_sm80, handle, args,
+                                   cmp_parts=None):
+    """Measure replay of one captured MLP-only CUDA Graph workload."""
+    try:
+        cmp_parts = cmp_parts or []
+        replay = make_qwen3_mlp_graph_replay_fn(
+            B, S, matmul_kernel, sleep_ns, sleep_freq,
+            cutlass_sm80, persistent_sm80, args)
+        for _ in range(1):
+            replay()
+        torch.cuda.synchronize()
+        time.sleep(1)
+        ni = auto_iterations(replay, args.target_seconds, pilot_iters=3)
+        ni = 1
+        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples = measure(
+            replay, ni, handle, sample_interval=args.nvml_interval)
+        flops = qwen3_mlp_graph_flops(B, S)
+        gflops = flops * ni / (el / 1000.0) / 1e9
+        nj = en * 1e6 / (flops * ni) if ni > 0 else 0.0
+        print(
+            f"  {'mlp_graph_replay':14s} | {matmul_kernel:12s} "
+            f"sleep={sleep_ns:6d}ns freq={sleep_freq:4d} iters={ni:3d} | "
+            f"{el:8.1f}ms {gflops:8.1f}GF {pw:6.1f}W "
+            f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C "
+            f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)"
+            f"{'  [' + ' | '.join(cmp_parts) + ']' if cmp_parts else ''}")
+        return {
+            "batch_size": B,
+            "seq_len": S,
+            "num_layers": ACTUAL_FORWARD_LAYERS,
+            "matmul_kernel": matmul_kernel,
+            "workload": "mlp_up_gate_down_x32_cuda_graph_replay",
+            "sleep_ns": sleep_ns,
+            "sleep_freq": sleep_freq,
+            "num_iters": ni,
+            "elapsed_ms": el,
+            "energy_mj": en,
+            "power_w": pw,
+            "sm_clock_mhz": sm_clk,
+            "temp_c": temp,
+            "gflops": gflops,
+            "nj_per_flop": nj,
+            "total_flops": flops,
+            "power_violation_before_ns": pv_bef,
+            "reference_time_before_ns": ref_bef,
+            "power_violation_during_ns": pv_dur,
+            "reference_time_during_ns": ref_dur,
+            "power_violation_ratio": pv_rat,
+        }
+    except Exception as e:
+        print(
+            f"  ⚠ MLP graph replay skipped: kernel={matmul_kernel} "
             f"sleep={sleep_ns} freq={sleep_freq}: {e}")
         try:
             torch.cuda.empty_cache()
@@ -974,17 +1134,92 @@ def main():
             "(NVML 순간값도 하드웨어 해상도가 mW 정수이며 갱신 주기가 있다)."
         ),
     )
+    parser.add_argument(
+        "--persistent-ctas-per-sm",
+        type=int,
+        default=2,
+        help="persistent_cta 커널에서 launch할 SM당 CTA 수. 기본값은 2, 실험용으로 8까지 가능.",
+    )
+    parser.add_argument(
+        "--persistent-chunk-tiles",
+        type=int,
+        default=1,
+        help="persistent_cta 커널에서 CTA가 atomicAdd 한 번으로 가져갈 tile 개수.",
+    )
+    parser.add_argument(
+        "--persistent-throttle-mode",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="persistent_cta throttle 방식: 0=clock64 wait, 1=instruction loop, 2=__nanosleep.",
+    )
+    parser.add_argument(
+        "-m",
+        "--matmul-kernel-mask",
+        "--kernel-mask",
+        dest="matmul_kernel_mask",
+        type=lambda x: int(x, 0),
+        default=0x7,
+        help=(
+            "실행할 matmul 커널 bitmask. bit0=cuBLAS, bit1=cutlass_sm80, "
+            "bit2=persistent_cta. 기본 0x7=전체, 0x3=cuBLAS+cutlass_sm80."
+        ),
+    )
+    parser.add_argument(
+        "-w",
+        "--workload-mask",
+        dest="workload_mask",
+        type=lambda x: int(x, 0),
+        default=0x7,
+        help=(
+            "실행할 workload bitmask. bit0=full_forward, bit1=matmul_only, "
+            "bit2=mlp_graph_replay. 기본 0x7=전체."
+        ),
+    )
     args = parser.parse_args()
     test_case = "FULL"
+
+    _raw_kernel_mask = int(args.matmul_kernel_mask)
+    kernel_mask = _raw_kernel_mask
+    if kernel_mask & ~0x7:
+        raise SystemExit(
+            f"Unsupported --matmul-kernel-mask={_raw_kernel_mask:#x}; "
+            "valid bits are 0x1(cublas), 0x2(cutlass_sm80), 0x4(persistent_cta).")
+
+    kernel_bits = {
+        "cublas": 0x1,
+        "cutlass_sm80": 0x2,
+        "persistent_cta": 0x4,
+    }
+
+    def kernel_enabled(name: str) -> bool:
+        return bool(kernel_mask & kernel_bits[name])
+
+    _raw_workload_mask = int(args.workload_mask)
+    workload_mask = _raw_workload_mask
+    if workload_mask & ~0x7:
+        raise SystemExit(
+            f"Unsupported --workload-mask={_raw_workload_mask:#x}; "
+            "valid bits are 0x1(full_forward), 0x2(matmul_only), "
+            "0x4(mlp_graph_replay).")
+
+    workload_bits = {
+        "full_forward": 0x1,
+        "matmul_only": 0x2,
+        "mlp_graph_replay": 0x4,
+    }
+
+    def workload_enabled(name: str) -> bool:
+        return bool(workload_mask & workload_bits[name])
 
     torch.cuda.set_device(0)
 
     try:
         import sleep_wmma as wmma_sleep_gemm
     except ImportError:
-        raise SystemExit(
-            "sleep_wmma not found.  Build first:\n"
-            "  cd /workspace/custum && python setup_wmma_sleep.py build_ext --inplace")
+        wmma_sleep_gemm = None
+        print("⚠ sleep_wmma not found. WMMA sleep kernels will be skipped.\n"
+              "  Build: cd /workspace/custum && python setup_wmma_sleep.py build_ext --inplace")
 
     # BF16 WMMA 확장 모듈 (선택적 로드 – 없으면 해당 커널 건너뜀)
     try:
@@ -996,13 +1231,19 @@ def main():
               "python setup_bf16_gemm.py build_ext --inplace")
 
     # CUTLASS SM80 BF16 GEMM (cuBLAS 동급 성능, BF16 정밀도 유지)
-    try:
-        import bf16_gemm_sm80 as cutlass_sm80
-    except ImportError:
+    cutlass_sm80 = None
+    if kernel_enabled("cutlass_sm80"):
+        try:
+            import bf16_gemm_sm80 as cutlass_sm80
+        except ImportError:
+            cutlass_sm80 = None
+            print("⚠ bf16_gemm_sm80 not found.  CUTLASS SM80 BF16 kernel will be skipped.\n"
+                  "  Build: cd /workspace/custum && "
+                  "python setup_bf16_sm80.py build_ext --inplace")
+    if kernel_enabled("cutlass_sm80") and cutlass_sm80 is None:
         cutlass_sm80 = None
-        print("⚠ bf16_gemm_sm80 not found.  CUTLASS SM80 BF16 kernel will be skipped.\n"
-              "  Build: cd /workspace/custum && "
-              "python setup_bf16_sm80.py build_ext --inplace")
+    elif not kernel_enabled("cutlass_sm80"):
+        print("cutlass_sm80 disabled by --matmul-kernel-mask")
 
     # Custom BF16 GEMM with __nanosleep (cp.async + WMMA + nanosleep K-loop)
     # 이 커널만 sleep_freq > 0 으로 동작; 나머지 커널은 sleep_ns=0 고정.
@@ -1022,6 +1263,21 @@ def main():
         print("⚠ bf16_gemm_sm80_kernel not found.  PTX SM80 kernel will be skipped.\n"
               "  Build: cd /workspace/custum && "
               "python setup_bf16_sm80_kernel.py build_ext --inplace")
+
+    # Persistent CTA BF16 GEMM: dense full tiles throttle, tail tiles unthrottled.
+    persistent_sm80 = None
+    if kernel_enabled("persistent_cta"):
+        try:
+            import bf16_gemm_sm80_persistent as persistent_sm80
+        except ImportError:
+            persistent_sm80 = None
+            print("⚠ bf16_gemm_sm80_persistent not found. Persistent CTA kernel will be skipped.\n"
+                  "  Build: cd /workspace/custum && "
+                  "python setup_bf16_sm80_persistent.py build_ext --inplace")
+    if kernel_enabled("persistent_cta") and persistent_sm80 is None:
+        persistent_sm80 = None
+    elif not kernel_enabled("persistent_cta"):
+        print("persistent_cta disabled by --matmul-kernel-mask")
 
     # CUTLASS 3.x SM90 BF16 GEMM (wgmma + TMA, SM120 backward-compatible)
     try:
@@ -1055,25 +1311,43 @@ def main():
     print(f"Tokens (M) : {args.batch_size * args.seq_len}")
     print(f"Output     : {args.output_csv}")
     print(f"Power samp.: {args.gpu_power_source} (--gpu-power-source)")
+    print(
+        "Matmul mask: "
+        f"raw={_raw_kernel_mask:#x} effective={kernel_mask:#x} "
+        f"enabled={','.join(name for name in kernel_bits if kernel_enabled(name)) or 'none'}")
+    print(
+        "Workloads  : "
+        f"raw={_raw_workload_mask:#x} effective={workload_mask:#x} "
+        f"enabled={','.join(name for name in workload_bits if workload_enabled(name)) or 'none'}")
 
     # sleep_ns_list = [0] + [2 ** (i) for i in range(5, 19)]
     # sleep_ns_list = [2 * i for i in range(1, 200)]
-    # sleep_ns_list = [0, 8, 16, 512, 1024, 4096, 8192, 16384, 32768]
+    # sleep_ns_list = [0, 1200, 1400, 1600, 1800]
     # sleep_ns_list = sorted(sleep_ns_list, reverse=True)
     # sleep_ns_list = [0, 16, 32768, 131072]
     # sleep_ns_list   = [0, 500, 1000, 1500, 2000, 2500]
-    sleep_ns_list = [0, 100, 800, 1600, 2400, 3600, 7200]
+    # sleep_ns_list = [0, 100, 800, 1600, 2400, 3600, 7200, 16384]
+    # sleep_ns_list = [0, 100, 200, 300]
     # sleep_ns_list = sorted(sleep_ns_list, reverse=True)
     # sleep_ns_list = [0, 100, 200, 500, 600, 700, 800]
-    # sleep_ns_list = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    # sleep_ns_list = [0, 1021,1022,1023,1024] # warp 단위로 sleep 할 경우
+    # sleep_ns_list = [0, 500, 1000, 1500, 2047, 2048] ## sm bubbling sleep
+    # sleep_ns_list = [0,500, 1000, 1500, 2040, 2200, 2300, 2400] ## sm bubbling sleep
+    # sleep_ns_list = [0,30000, 40000, 50000, 60000] ## sm 188
+    sleep_ns_list = [0, 2045, 2047, 2048] ## sm bubbling clock64
+    # sleep_ns_list = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000] ## sm step sleep
+
+    # sleep_ns_list = [0, 1000, 2000, 3000, 4000, 5000]
+    # sleep_ns_list = [0, 1000, 2000, 3000, 4000, 5000]
+    # sleep_ns_list = [0, 9, 9, 9, 9]
     # sleep_ns_list = [0, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
     # sleep_ns_list = [140,141,142,143,144,145,146,147,148,149,150]
     # sleep_freq_list = [0, 1, 4, 16, 64, 256, 1024]
     sleep_freq_list = [32768, 16384, 8192, 4096, 2048, 1024, 256, 64, 16, 4, 1, 0]
     sleep_freq_list = [1024, 256, 64, 16, 4, 1, 0]
     # sleep_freq_list = [1, 2, 4]
-    sleep_freq_list = [1]
-    sleep_freq_list = [0]
+    sleep_freq_list = [2, 4, 6, 8, 10, 12]
+    sleep_freq_list = [2]
     # clock_list = [2430, 2130, 1830, 1530, 1230, 930]
     clock_list = [2430]
     # clock_list = [2430]
@@ -1083,9 +1357,12 @@ def main():
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
     results = []
     actual_forward_results = []
+    mlp_graph_results = []
     detail_sink = None
     stem, _ext = os.path.splitext(args.output_csv)
     detail_csv_path = f"{stem}_{pid}_detail.csv"
+    actual_forward_csv = f"{stem}_{pid}_actual_forward.csv"
+    mlp_graph_csv = f"{stem}_{pid}_mlp_graph_replay.csv"
     detail_sink = DetailCsvSink(detail_csv_path)
     print(f"Detail CSV (streaming, NVML Δt={args.nvml_interval}s): {detail_csv_path}")
 
@@ -1155,27 +1432,57 @@ def main():
                 matmuls = build_layer_matmuls(batch_sz, S)
                 total_flops_fwd = sum(2.0 * m * k * n * cnt
                                       for m, k, n, _, cnt in matmuls)
-                print(f"\n{'='*72}")
-                print(
-                    f"  Actual Qwen3-8B forward kernel sequence  "
-                    f"B={batch_sz}  S={S}  layers={ACTUAL_FORWARD_LAYERS}  "
-                    "(FlashAttention + real GEMM launches, no estimate)")
-                print(f"{'='*72}")
-                for _kernel in ("cublas", "cutlass_sm80"):
-                    if _kernel == "cutlass_sm80" and cutlass_sm80 is None:
-                        continue
-                    _sleep_iter = sleep_ns_list if _kernel == "cutlass_sm80" else [0]
-                    for _sns in _sleep_iter:
-                        for _sfreq in sleep_freq_list:
-                            row = measure_qwen3_actual_forward(
-                                batch_sz, S, _kernel, _sns, _sfreq,
-                                cutlass_sm80, handle, args)
-                            if row is not None:
-                                row["label"] = args.run_label.strip() or test_case
-                                row["pid"] = pid
-                                row["test_case"] = "QWEN3_8B_ACTUAL_FORWARD"
-                                actual_forward_results.append(row)
-                            time.sleep(1)
+                if workload_enabled("full_forward"):
+                    print(f"\n{'='*72}")
+                    print(
+                        f"  Actual Qwen3-8B forward kernel sequence  "
+                        f"B={batch_sz}  S={S}  layers={ACTUAL_FORWARD_LAYERS}  "
+                        "(FlashAttention + real GEMM launches, no estimate)")
+                    print(f"{'='*72}")
+                    actual_cutlass_base = None
+                    actual_cutlass_by_sleep = {}
+                    for _kernel in ("cutlass_sm80", "cublas", "persistent_cta"):
+                        if not kernel_enabled(_kernel):
+                            continue
+                        if _kernel == "cutlass_sm80" and cutlass_sm80 is None:
+                            continue
+                        if _kernel == "persistent_cta" and persistent_sm80 is None:
+                            continue
+                        _sleep_iter = (
+                            sleep_ns_list
+                            if _kernel in ("cutlass_sm80", "persistent_cta")
+                            else [0])
+                        _freq_iter = sleep_freq_list if _kernel != "cublas" else [0]
+                        for _sns in _sleep_iter:
+                            for _sfreq in _freq_iter:
+                                row = measure_qwen3_actual_forward(
+                                    batch_sz, S, _kernel, _sns, _sfreq,
+                                    cutlass_sm80, persistent_sm80, handle, args)
+                                if row is not None:
+                                    if _kernel == "cutlass_sm80":
+                                        ref = {
+                                            "gflops": row["gflops"],
+                                            "sm_clock_mhz": row["sm_clock_mhz"],
+                                        }
+                                        actual_cutlass_by_sleep[(_sns, _sfreq)] = ref
+                                        if actual_cutlass_base is None and _sns == 0:
+                                            actual_cutlass_base = ref
+                                    cmp_parts = _cutlass_cmp_parts(
+                                        row["gflops"], row["sm_clock_mhz"],
+                                        actual_cutlass_base, "cutlass_sm80@0ns")
+                                    same_sleep_ref = actual_cutlass_by_sleep.get((_sns, _sfreq))
+                                    if same_sleep_ref is not None and _kernel != "cutlass_sm80":
+                                        cmp_parts.extend(_cutlass_cmp_parts(
+                                            row["gflops"], row["sm_clock_mhz"],
+                                            same_sleep_ref,
+                                            f"cutlass_sm80@sleep={_sns}ns"))
+                                    if cmp_parts:
+                                        print(f"    compare            | [{' | '.join(cmp_parts)}]")
+                                    row["label"] = args.run_label.strip() or test_case
+                                    row["pid"] = pid
+                                    row["test_case"] = "QWEN3_8B_ACTUAL_FORWARD"
+                                    actual_forward_results.append(row)
+                                time.sleep(1)
 
                 # 기준 토큰 수 (256 × 16 = 4096) 대비 비율로 warmup/ni 스케일
                 if batch_sz * S >= 256 * 16:
@@ -1207,8 +1514,6 @@ def main():
                 warmup_scaled = 300
                 ni_base = 300
                 ni_base_kernel = 300
-                if S == 1:
-                    ni_base_kernel = 50 * 1000
                 print(f"\n{'#'*72}")
                 print(f"  Qwen3-8B prefill  B={batch_sz}  S={S}  tokens={batch_sz*S}  "
                       f"total={total_flops_fwd/1e9:.1f} GFLOP")
@@ -1217,7 +1522,8 @@ def main():
                 # ───────────────────────────────────────────
                 #  Per-layer breakdown
                 # ───────────────────────────────────────────
-                for M, K, N, name, count in matmuls:
+                for M, K, N, name, count in (
+                    matmuls if workload_enabled("matmul_only") else []):
                         flops_per_gemm = 2.0 * M * K * N
                         tag = f"{name}(×{count})"
 
@@ -1276,77 +1582,83 @@ def main():
                                     handle, pynvml.NVML_CLOCK_SM)
                             except Exception:
                                 _max_sm_clk = 2400
-                            while True:
-                                for _ in range(20):
-                                    torch.mm(A_bf16, B_bf16, out=C_bf16)
-                                torch.cuda.synchronize()
-                                try:
-                                    _cur_clk = pynvml.nvmlDeviceGetClockInfo(
-                                        handle, pynvml.NVML_CLOCK_SM)
-                                except Exception:
-                                    _cur_clk = _max_sm_clk
-                                if (_cur_clk >= _max_sm_clk * _burn_target_pct or
-                                        time.time() - _burn_start >= _burn_timeout_s):
-                                    break
+                            if kernel_enabled("cublas"):
+                                while True:
+                                    for _ in range(20):
+                                        torch.mm(A_bf16, B_bf16, out=C_bf16)
+                                    torch.cuda.synchronize()
+                                    try:
+                                        _cur_clk = pynvml.nvmlDeviceGetClockInfo(
+                                            handle, pynvml.NVML_CLOCK_SM)
+                                    except Exception:
+                                        _cur_clk = _max_sm_clk
+                                    if (_cur_clk >= _max_sm_clk * _burn_target_pct or
+                                            time.time() - _burn_start >= _burn_timeout_s):
+                                        break
                             # ─────────────────────────────────────────────────────────────────
 
-                            # ── cuBLAS FP16 baseline ──
-                            fn_cublas = lambda: torch.mm(A, B, out=C_fp16)
-                            ni = auto_iterations(fn_cublas, args.target_seconds)
-                            # warmup_scaled = int(ni * 0.5)
-                            warmup_scaled = 0
-                            ni = 100
-                            for _ in range(warmup_scaled):
-                                fn_cublas()
-                            # ni = auto_iterations(fn_cublas, args.target_seconds)
-                            # ni = ni_base
-                            _cg_fp16 = cuda_graph_dot_path(
-                                args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_fp16")
-                            cuda_graph_capture_debug_dump(fn_cublas, _cg_fp16)
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.nvtx.range_push(f"{tag} cuBLAS sleep=0ns")
-                            el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
-                                fn_cublas, ni, handle, sample_interval=args.nvml_interval)
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.nvtx.range_pop()
-                            gf = flops_per_gemm * ni / (el / 1000) / 1e9
-                            nj = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
-                            print(f"  {'cuBLAS':14s} | sleep=     0ns freq=   0  iters={ni:5d} | "
-                                f"{el:8.1f}ms {gf:8.1f}GF {pw:6.1f}W "
-                                f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C"
-                                f"  PVpre={pv_bef}ns/{ref_bef}ns"
-                                f"  PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
-                            rec = dict(
-                                batch_size=batch_sz, seq_len=S,
-                                layer=name, count=count,
-                                M=M, K=K, N=N, kernel="cublas",
-                                sleep_ns=0, sleep_freq=0, num_iters=ni,
-                                elapsed_ms=el, gflops=gf, power_w=pw,
-                                energy_mj=en, nj_per_flop=nj, sm_clock_mhz=sm_clk,
-                                temp_c=temp,
-                                gpu_power_cap_w=gpu_power_cap_w,
-                                power_violation_before_ns=pv_bef,
-                                reference_time_before_ns=ref_bef,
-                                power_violation_during_ns=pv_dur,
-                                reference_time_during_ns=ref_dur,
-                                power_violation_ratio=pv_rat,
-                                _nvml_samples=nvml_samples)
-                            commit_measure(results, rec, detail_sink, args, test_case, pid)
-                            time.sleep(1)
-                            # ── cuBLAS BF16 baseline ──
-                            fn_cublas_bf16 = lambda: torch.mm(A_bf16, B_bf16, out=C_bf16)
-                            # for _ in range(warmup_scaled):
-                            #     fn_cublas_bf16()
-                            ni_bf16 = auto_iterations(fn_cublas_bf16, args.target_seconds)
-                            ni_bf16 = ni_base
-                            _cg_bf16 = cuda_graph_dot_path(
-                                args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_bf16")
-                            cuda_graph_capture_debug_dump(fn_cublas_bf16, _cg_bf16)
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.nvtx.range_push(f"{tag} cuBLAS_BF16 sleep=0ns")
+                            gf = None
+                            if kernel_enabled("cublas"):
+                                # ── cuBLAS FP16 baseline ──
+                                fn_cublas = lambda: torch.mm(A, B, out=C_fp16)
+                                ni = auto_iterations(fn_cublas, args.target_seconds)
+                                # warmup_scaled = int(ni * 0.5)
+                                warmup_scaled = 30
+                                ni = 30
+                                for _ in range(warmup_scaled):
+                                    fn_cublas()
+                                # ni = auto_iterations(fn_cublas, args.target_seconds)
+                                # ni = ni_base
+                                _cg_fp16 = cuda_graph_dot_path(
+                                    args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_fp16")
+                                cuda_graph_capture_debug_dump(fn_cublas, _cg_fp16)
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.nvtx.range_push(f"{tag} cuBLAS sleep=0ns")
+                                el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
+                                    fn_cublas, ni, handle, sample_interval=args.nvml_interval)
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.nvtx.range_pop()
+                                gf = flops_per_gemm * ni / (el / 1000) / 1e9
+                                nj = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
+                                print(f"  {'cuBLAS':14s} | sleep=     0ns freq=   0  iters={ni:5d} | "
+                                    f"{el:8.1f}ms {gf:8.1f}GF {pw:6.1f}W "
+                                    f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C"
+                                    f"  PVpre={pv_bef}ns/{ref_bef}ns"
+                                    f"  PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
+                                rec = dict(
+                                    batch_size=batch_sz, seq_len=S,
+                                    layer=name, count=count,
+                                    M=M, K=K, N=N, kernel="cublas",
+                                    sleep_ns=0, sleep_freq=0, num_iters=ni,
+                                    elapsed_ms=el, gflops=gf, power_w=pw,
+                                    energy_mj=en, nj_per_flop=nj, sm_clock_mhz=sm_clk,
+                                    temp_c=temp,
+                                    gpu_power_cap_w=gpu_power_cap_w,
+                                    power_violation_before_ns=pv_bef,
+                                    reference_time_before_ns=ref_bef,
+                                    power_violation_during_ns=pv_dur,
+                                    reference_time_during_ns=ref_dur,
+                                    power_violation_ratio=pv_rat,
+                                    _nvml_samples=nvml_samples)
+                                commit_measure(results, rec, detail_sink, args, test_case, pid)
+                                time.sleep(1)
+                            else:
+                                print("  cuBLAS skipped by --matmul-kernel-mask")
+                            if kernel_enabled("cublas"):
+                                # ── cuBLAS BF16 baseline ──
+                                fn_cublas_bf16 = lambda: torch.mm(A_bf16, B_bf16, out=C_bf16)
+                                # for _ in range(warmup_scaled):
+                                #     fn_cublas_bf16()
+                                ni_bf16 = auto_iterations(fn_cublas_bf16, args.target_seconds)
+                                ni_bf16 = ni_base
+                                _cg_bf16 = cuda_graph_dot_path(
+                                    args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_bf16")
+                                cuda_graph_capture_debug_dump(fn_cublas_bf16, _cg_bf16)
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.nvtx.range_push(f"{tag} cuBLAS_BF16 sleep=0ns")
                             # el_b, en_b, pw_b, sm_clk_b, temp_b, pv_bef_b, ref_bef_b, pv_dur_b, ref_dur_b, pv_rat_b = measure(
                             #     fn_cublas_bf16, ni_bf16, handle)
                             # if torch.cuda.is_available():
@@ -1388,7 +1700,7 @@ def main():
                             # has_sleep=False → sleep_ns=0 한 번만 측정
                             kernel_sweep = []
 
-                            if hasattr(wmma_sleep_gemm, 'gemm_opt'):
+                            if wmma_sleep_gemm is not None and hasattr(wmma_sleep_gemm, 'gemm_opt'):
                                 kernel_sweep.append((
                                     "wmma_opt",
                                     lambda _s, _f: wmma_sleep_gemm.gemm_opt(A, B, _s, _f),
@@ -1400,11 +1712,12 @@ def main():
                             #         lambda _s, _f: wmma_sleep_gemm.gemm_hiperf(A, B, _s, _f),
                             #         True,
                             #     ))
-                            kernel_sweep.append((
-                                "wmma_simple",
-                                lambda _s, _f: wmma_sleep_gemm.gemm(A, B, _s, _f, False),
-                                True,
-                            ))
+                            if wmma_sleep_gemm is not None:
+                                kernel_sweep.append((
+                                    "wmma_simple",
+                                    lambda _s, _f: wmma_sleep_gemm.gemm(A, B, _s, _f, False),
+                                    True,
+                                ))
 
                             # ── BF16 WMMA kernels (nanosleep before store_matrix_sync) ────────
                             # if bf16_gemm is not None:
@@ -1435,7 +1748,7 @@ def main():
                             # ── CUTLASS SM80 BF16 GEMM (cuBLAS 동급, 순수 BF16) ─────────────────
                             # CUTLASS 2.x sm80 집합체: cp.async + mma.sync m16n8k16 + 3-stage pipeline
                             # has_sleep=False: CUTLASS 커널 내부에 sleep 삽입 불가
-                            if cutlass_sm80 is not None:
+                            if kernel_enabled("cutlass_sm80") and cutlass_sm80 is not None:
                                 _A_bf16_cont = A_bf16.contiguous()
                                 _B_bf16_cont = B_bf16.contiguous()
                                 # cutlass_sm80 기준값을 먼저 확보해 이후 커널 로그에서
@@ -1488,6 +1801,32 @@ def main():
                                     print(f"  ⚠ ptx_sm80 skipped: M must be ×128, N ×128, K ×32 "
                                         f"(got {M},{N},{K})")
 
+                            # ── Persistent CTA SM80 BF16 GEMM ─────────────────────────────────
+                            # CTA가 atomic tile queue에서 chunk를 받아 연속 처리한다.
+                            # full dense tile에서만 throttle을 적용하고 tail tile은 latency 보호를 위해 skip.
+                            if kernel_enabled("persistent_cta") and persistent_sm80 is not None:
+                                _ok_persistent = (N % 8 == 0 and K % 8 == 0)
+                                if _ok_persistent:
+                                    _A_persistent = A_bf16.contiguous()
+                                    _B_persistent = B_bf16.contiguous()
+                                    kernel_sweep.append((
+                                        "persistent_cta",
+                                        lambda _s, _f,
+                                            _A=_A_persistent, _B=_B_persistent:
+                                            persistent_sm80.gemm_sm80_persistent(
+                                                _A,
+                                                _B,
+                                                _s,
+                                                _f,
+                                                args.persistent_throttle_mode,
+                                                args.persistent_ctas_per_sm,
+                                                args.persistent_chunk_tiles),
+                                        True,
+                                    ))
+                                else:
+                                    print(f"  ⚠ persistent_cta skipped: N and K must be multiples of 8 "
+                                        f"(got {M},{N},{K})")
+
                             # ── Custom BF16 GEMM with __nanosleep ────────────────────────────────
                             # 이 커널만 sleep_freq > 0 으로 동작.
                             # K-루프 내부에 __nanosleep 삽입 → 파워 duty-cycle 직접 제어.
@@ -1537,15 +1876,18 @@ def main():
                                 for sns in sns_iter:
                                     for sfreq in sleep_freq_list:
                                         # if kname == "ptx_sm80" or kname == "cutlass_sm80" or kname == "bf16_custom":
-                                        if kname == "cutlass_sm80" :
+                                        if (
+                                            kname in ("cutlass_sm80", "persistent_cta")
+                                            and kernel_enabled(kname)
+                                        ):
                                             pass
                                         else:
                                             continue
                                         fn = lambda _s=sns, _f=sfreq: kfn(_s, _f)
                                         ni = auto_iterations(fn, args.target_seconds)
                                         # warmup_scaled = int(ni * 0.5)
-                                        warmup_scaled = 0
-                                        ni = 100
+                                        warmup_scaled = 30
+                                        ni = 30
                                         for _ in range(warmup_scaled):
                                             fn()
 
@@ -1622,6 +1964,58 @@ def main():
                                         commit_measure(results, rec, detail_sink, args, test_case, pid)
                                     
                                         time.sleep(1)
+
+                if workload_enabled("mlp_graph_replay"):
+                    print(f"\n{'='*72}")
+                    print(
+                        "  MLP CUDA Graph replay workload  "
+                        f"B={batch_sz}  S={S}  layers={ACTUAL_FORWARD_LAYERS}  "
+                        "(mlp_up -> mlp_gate -> mlp_down) x 32")
+                    print(f"{'='*72}")
+                    graph_cutlass_base = None
+                    graph_cutlass_by_sleep = {}
+                    for _kernel in ("cutlass_sm80", "cublas", "persistent_cta"):
+                        if not kernel_enabled(_kernel):
+                            continue
+                        if _kernel == "cutlass_sm80" and cutlass_sm80 is None:
+                            continue
+                        if _kernel == "persistent_cta" and persistent_sm80 is None:
+                            continue
+                        _sleep_iter = (
+                            sleep_ns_list
+                            if _kernel in ("cutlass_sm80", "persistent_cta")
+                            else [0])
+                        _freq_iter = sleep_freq_list if _kernel != "cublas" else [0]
+                        for _sns in _sleep_iter:
+                            for _sfreq in _freq_iter:
+                                row = measure_qwen3_mlp_graph_replay(
+                                    batch_sz, S, _kernel, _sns, _sfreq,
+                                    cutlass_sm80, persistent_sm80, handle, args)
+                                if row is not None:
+                                    if _kernel == "cutlass_sm80":
+                                        ref = {
+                                            "gflops": row["gflops"],
+                                            "sm_clock_mhz": row["sm_clock_mhz"],
+                                        }
+                                        graph_cutlass_by_sleep[(_sns, _sfreq)] = ref
+                                        if graph_cutlass_base is None and _sns == 0:
+                                            graph_cutlass_base = ref
+                                    cmp_parts = _cutlass_cmp_parts(
+                                        row["gflops"], row["sm_clock_mhz"],
+                                        graph_cutlass_base, "cutlass_sm80@0ns")
+                                    same_sleep_ref = graph_cutlass_by_sleep.get((_sns, _sfreq))
+                                    if same_sleep_ref is not None and _kernel != "cutlass_sm80":
+                                        cmp_parts.extend(_cutlass_cmp_parts(
+                                            row["gflops"], row["sm_clock_mhz"],
+                                            same_sleep_ref,
+                                            f"cutlass_sm80@sleep={_sns}ns"))
+                                    if cmp_parts:
+                                        print(f"    compare            | [{' | '.join(cmp_parts)}]")
+                                    row["label"] = args.run_label.strip() or test_case
+                                    row["pid"] = pid
+                                    row["test_case"] = "QWEN3_8B_MLP_GRAPH_REPLAY"
+                                    mlp_graph_results.append(row)
+                                time.sleep(1)
                     #  Full-forward estimate  (aggregate per sleep_ns)
                     # ───────────────────────────────────────────
                 # print(f"\n{'='*72}")
@@ -1772,7 +2166,6 @@ def main():
                 for sr in summary_rows:
                     w.writerow(sr)
 
-            actual_forward_csv = f"{stem}_{pid}_actual_forward.csv"
             if actual_forward_results:
                 actual_forward_fields = [
                     "label", "pid", "test_case",
@@ -1800,10 +2193,99 @@ def main():
                                 out[k] = round(out[k], 4)
                         w.writerow(out)
 
+            if mlp_graph_results:
+                mlp_graph_fields = [
+                    "label", "pid", "test_case",
+                    "batch_size", "seq_len",
+                    "num_layers", "workload",
+                    "matmul_kernel", "sleep_ns", "sleep_freq",
+                    "num_iters",
+                    "elapsed_ms", "energy_mj", "power_w",
+                    "gflops", "nj_per_flop", "total_flops",
+                    "sm_clock_mhz", "temp_c",
+                    "power_violation_before_ns", "reference_time_before_ns",
+                    "power_violation_during_ns", "reference_time_during_ns",
+                    "power_violation_ratio",
+                ]
+                with open(mlp_graph_csv, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=mlp_graph_fields)
+                    w.writeheader()
+                    for row in mlp_graph_results:
+                        out = dict(row)
+                        for k in (
+                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "nj_per_flop", "total_flops", "sm_clock_mhz",
+                            "temp_c", "power_violation_ratio"):
+                            if k in out and isinstance(out[k], float):
+                                out[k] = round(out[k], 4)
+                        w.writerow(out)
+
             print(f"\n✅ Detail (streaming NVML, label={run_label!r}) → {detail_csv_path}")
             print(f"✅ Summary (aggregated)                  → {summary_csv}")
             if actual_forward_results:
                 print(f"✅ Actual forward (FlashAttention + GEMM) → {actual_forward_csv}")
+            if mlp_graph_results:
+                print(f"✅ MLP graph replay                      → {mlp_graph_csv}")
+        else:
+            run_label = (args.run_label.strip() or test_case)
+            if actual_forward_results:
+                actual_forward_fields = [
+                    "label", "pid", "test_case",
+                    "batch_size", "seq_len",
+                    "num_layers",
+                    "matmul_kernel", "sleep_ns", "sleep_freq",
+                    "attention_kernel", "num_iters",
+                    "elapsed_ms", "energy_mj", "power_w",
+                    "gflops", "nj_per_flop", "total_flops",
+                    "sm_clock_mhz", "temp_c",
+                    "power_violation_before_ns", "reference_time_before_ns",
+                    "power_violation_during_ns", "reference_time_during_ns",
+                    "power_violation_ratio",
+                ]
+                with open(actual_forward_csv, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=actual_forward_fields)
+                    w.writeheader()
+                    for row in actual_forward_results:
+                        out = dict(row)
+                        for k in (
+                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "nj_per_flop", "total_flops", "sm_clock_mhz",
+                            "temp_c", "power_violation_ratio"):
+                            if k in out and isinstance(out[k], float):
+                                out[k] = round(out[k], 4)
+                        w.writerow(out)
+                print(f"\n✅ Actual forward (FlashAttention + GEMM) → {actual_forward_csv}")
+
+            if mlp_graph_results:
+                mlp_graph_fields = [
+                    "label", "pid", "test_case",
+                    "batch_size", "seq_len",
+                    "num_layers", "workload",
+                    "matmul_kernel", "sleep_ns", "sleep_freq",
+                    "num_iters",
+                    "elapsed_ms", "energy_mj", "power_w",
+                    "gflops", "nj_per_flop", "total_flops",
+                    "sm_clock_mhz", "temp_c",
+                    "power_violation_before_ns", "reference_time_before_ns",
+                    "power_violation_during_ns", "reference_time_during_ns",
+                    "power_violation_ratio",
+                ]
+                with open(mlp_graph_csv, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=mlp_graph_fields)
+                    w.writeheader()
+                    for row in mlp_graph_results:
+                        out = dict(row)
+                        for k in (
+                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "nj_per_flop", "total_flops", "sm_clock_mhz",
+                            "temp_c", "power_violation_ratio"):
+                            if k in out and isinstance(out[k], float):
+                                out[k] = round(out[k], 4)
+                        w.writerow(out)
+                print(f"✅ MLP graph replay                      → {mlp_graph_csv}")
+
+            if not actual_forward_results and not mlp_graph_results:
+                print(f"\n⚠ No workload results were produced (label={run_label!r}).")
     finally:
         if detail_sink is not None:
             detail_sink.close()
@@ -1825,6 +2307,27 @@ def main():
                 )
             except Exception as e:
                 print(f"⚠ plot_detail_csv 자동 실행 실패: {e}")
+        _actual_plot_script = os.path.join(_custum_dir, "plot_actual_forward_csv.py")
+        if (
+            actual_forward_csv
+            and os.path.isfile(actual_forward_csv)
+            and os.path.isfile(_actual_plot_script)
+        ):
+            _actual_png = os.path.splitext(actual_forward_csv)[0] + "_plot.png"
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        _actual_plot_script,
+                        actual_forward_csv,
+                        "-o",
+                        _actual_png,
+                    ],
+                    check=False,
+                    timeout=180,
+                )
+            except Exception as e:
+                print(f"⚠ plot_actual_forward_csv 자동 실행 실패: {e}")
         stop_sampler()       # sampler 프로세스 정상 종료
         if clock_changed:
             print("\n1. Resetting GPU Locked Clocks...", end=" ")
