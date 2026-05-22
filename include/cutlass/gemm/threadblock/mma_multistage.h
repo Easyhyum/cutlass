@@ -34,9 +34,36 @@
 
 #pragma once
 
-// ── CUTLASS_SLEEP_ENABLED : bf16_gemm_sm80 빌드 시 -DCUTLASS_SLEEP_ENABLED 로 활성화 ──
-// kCutlassSleepNs / kCutlassSleepFreq 정의는 cutlass_sleep_globals.cuh 에 있음.
-// #pragma once 로 보호되므로 bf16_gemm_sm80.cu 에서도 같은 헤더를 include 해도 안전.
+// ── CUTLASS_SLEEP_ENABLED : runtime symbol 정의용 ──────────────────────────
+// ── CUTLASS_METHOD_A_BM_ENABLED : v7 ring-rotating warp mis-aligned bubble ──
+//
+//   v7 디자인:
+//     hook: mac_loop_iter()의 warp_mma_k 루프 내부, HMMA 직후.
+//     Gate: warp_mma_k == ((warp_in_cta + time_phase) & (kWGI-1))
+//     time_phase = gemm_k_iterations & (kWGI-1)  → 매 outer iter 회전
+//     → 같은 warp의 sleep 위치가 outer iter 마다 회전 (동일 지점 반복 없음)
+//     → 같은 시점에 warp 절반만 sleep → 다른 절반은 HMMA 계속 → mis-align 유지
+//     → mac_loop_iter 내부에 __syncthreads 없음 (gmem_wait 만 sync) → drift 보존
+//     → 모든 warp의 총 sleep 시간 동일 → 동시 완료
+//
+//   왜 별도 build flag?
+//     v6 시도: CUTLASS_SLEEP_ENABLED 단일 flag로 인라인. baseline -15% regression
+//     원인 — __constant__ memory gated 조건문이 inner unrolled loop의 컴파일러
+//     최적화 (register alloc, unroll) 방해.
+//     해결: CUTLASS_METHOD_A_BM_ENABLED 가 없으면 inner-loop 코드가 아예 존재
+//     하지 않음 → baseline 100% 보존.
+//     setup_bf16_sm80*.py 에서 두 binary 빌드 권장: 하나는 baseline (이 flag
+//     없음), 하나는 Method A (flag 있음).
+//
+//   파라미터:
+//     kCutlassSleepStaggerNs = sleep duration (ns); 0 = no sleep (Method A off)
+//     kCutlassSleepStaggerMod = legacy (현재 v7에서는 미사용)
+//
+//   이전 버전 백업:
+//     v3_pipeline_aware_with_sleep_residue_20260521/  (sleep residue)
+//     v4_pipeline_aware_only_20260521/                (clock64 spin)
+//     v5_warp_nanosleep_20260521/                     (post-gmem_wait, all-warps)
+//     v6_warp_mis_aligned_20260521/                   (no temporal rotation)
 #ifdef CUTLASS_SLEEP_ENABLED
 #include "cutlass/cutlass_sleep_globals.cuh"
 #endif
@@ -509,21 +536,7 @@ public:
     IteratorA &iterator_A,          ///< [in|out] iterator over A operand in global memory
     IteratorB &iterator_B,          ///< [in|out] iterator over B operand in global memory
     int &gemm_k_iterations)
-    // unsigned int warp_in_cta,
-    // unsigned int smid,
-    // unsigned int k_gemm_outer_iter)         ///< [in|out] number of threadblock mainloop iterations remaining
   {
-
-    // bool ascend_flag = k_gemm_outer_iter % 2 == 0 ? true : false;
-    // Unroll the warp-level MMA tiles of a threadblock's mainloop iteration
-    // #ifdef CUTLASS_SLEEP_ENABLED
-    // // if (warp_mma_k == 0 && gemm_k_iterations > Base::kStages && gemm_k_iterations % 2 == warp_in_cta % 2) {
-    // // if (kCutlassSleepNs != 0 && warp_mma_k == 0 && gemm_k_iterations > 20 && smid % 2  == gemm_k_iterations % 2) {
-    // if ((smid ^ gemm_k_iterations) & 1u) {
-    //     __nanosleep(kCutlassSleepNs);
-    // }
-    // #endif
-
     CUTLASS_PRAGMA_UNROLL
     for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations; ++warp_mma_k) {
 
@@ -537,23 +550,6 @@ public:
       this->warp_tile_iterator_B_.load(pipe_state.warp_loaded_frag_B_[(warp_mma_k + 1) % 2]);
       ++this->warp_tile_iterator_B_;
 
-
-      // #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
-      //       if (kCutlassSleepNs != 0 && warp_mma_k == 1) {
-      //         unsigned long long const __mma_t0 = clock64();
-      //         unsigned int const tid =
-      //             threadIdx.z * blockDim.y * blockDim.x +
-      //             threadIdx.y * blockDim.x +
-      //             threadIdx.x;
-      //         unsigned int const warp_in_cta = tid / 32u;
-              
-      //         if (gemm_k_iterations % 8 == warp_in_cta % 8)
-      //         // __nanosleep(kCutlassSleepNs);
-      //           while ((clock64() - __mma_t0) < kCutlassSleepNs) {
-      //             // intentional busy wait
-      //           }
-      //       }
-      // #endif
       // Except for the first warp-tile, all warp-tiles convert their incoming shared memory fragments as necessary
       if (warp_mma_k > 0) {
         warp_mma_.transform(
@@ -585,25 +581,42 @@ public:
           accum
         );
       }
-// #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
-      // unsigned long long const __mma_cycles = clock64() - __mma_t0;
-      // if ((threadIdx.x & 31u) == 0u) {
-      //   unsigned int const tid =
-      //       threadIdx.z * blockDim.y * blockDim.x +
-      //       threadIdx.y * blockDim.x +
-      //       threadIdx.x;
-      //   unsigned int const warp_in_cta = tid / 32u;
-      //   printf(
-      //       "[MMA_TIMING] warp_in_cta=%u warp_mma_k=%d mma_cycles=%llu "
-      //       "blk=(%u,%u,%u)\n",
-      //       warp_in_cta,
-      //       warp_mma_k,
-      //       __mma_cycles,
-      //       blockIdx.x,
-      //       blockIdx.y,
-      //       blockIdx.z);
-      // }
-// #endif
+
+#if defined(CUTLASS_METHOD_A_BM_ENABLED)
+      // ── Method A v7 : ring-rotating warp mis-aligned bubble sync ───────────
+      //  변경 사유 (v6 → v7):
+      //    1) v6의 inner-loop conditional 블록 자체가 baseline -15% regression.
+      //       해결: 별도 build flag (CUTLASS_METHOD_A_BM_ENABLED) 로 가드 →
+       //      flag 없으면 코드 완전 부재, baseline 그대로.
+      //    2) 사용자 지적: "하나의 warp가 매번 동일지점에서 sleep 되면 안 됨".
+      //       해결: time_phase (gemm_k_iterations 기반)로 매 outer iter 마다
+      //       각 warp의 sleep 위치가 회전. 결과적으로 모든 warp가 같은 총
+      //       시간 sleep 하므로 동시 완료 보장.
+      //
+      //  Gate:  warp_mma_k == ((warp_in_cta + time_phase) & (kWGI - 1))
+      //  Effect (kWGI=2, 4 warps):
+      //    outer iter t  (time_phase=0): warps 0,2 sleep at slot 0; warps 1,3 sleep at slot 1
+      //    outer iter t+1(time_phase=1): warps 0,2 sleep at slot 1; warps 1,3 sleep at slot 0
+      //    → warp 0 의 sleep 위치가 회전 (slot 0 → 1 → 0 → 1 ...)
+      //    → 매 시점 HMMA 발사 warp 수 = N/2 (peak 절반)
+      //    → 매 warp 총 sleep 시간 동일 → 동시 완료
+      if (kCutlassSleepStaggerNs > 0u) {
+        unsigned int const tid_v7 =
+            threadIdx.z * blockDim.y * blockDim.x +
+            threadIdx.y * blockDim.x +
+            threadIdx.x;
+        unsigned int const warp_in_cta_v7 = tid_v7 >> 5u;
+        unsigned int const kWGImask = Base::kWarpGemmIterations - 1u;
+        unsigned int const time_phase =
+            static_cast<unsigned int>(gemm_k_iterations) & kWGImask;
+        unsigned int const my_slot =
+            (warp_in_cta_v7 + time_phase) & kWGImask;
+        if (static_cast<unsigned int>(warp_mma_k) == my_slot) {
+          __nanosleep(kCutlassSleepStaggerNs);
+        }
+      }
+#endif
+
       // Except for the last warp-tile, all warp-tiles issue their share of
       // global->shared fragment copies
       if (warp_mma_k < Base::kWarpGemmIterations - 1) {
@@ -640,6 +653,9 @@ public:
         // Wait until we have at least one completed global fetch stage
         gmem_wait();
 
+        // (v6: post-gmem_wait sleep removed. Sleep moved INTO warp_mma_k loop
+        //  with warp_in_cta-gated position for true warp mis-alignment.)
+
         // Move to the next global fetch stage
         advance_smem_write_stage(iterator_A, iterator_B);
         advance_smem_read_stage();
@@ -675,13 +691,10 @@ public:
       IteratorB &iterator_B)        ///< [in|out] iterator over B operand in global memory
   {
     PipeState pipe_state;
-    unsigned int const tid =
-        threadIdx.z * blockDim.y * blockDim.x +
-        threadIdx.y * blockDim.x +
-        threadIdx.x;
-    unsigned int const warp_in_cta = tid / 32u;
-    unsigned int smid = 0u;
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    // (v4: tid/warp_in_cta/smid extraction moved into mac_loop_iter where the
+    //  pipeline-aware spin needs smid. Removing dead variable here so that any
+    //  register pressure or compiler scheduling artifact from holding smid in
+    //  a register across the whole mainloop is eliminated.)
     // Disable global fetching if done with global fetch iterations
     iterator_A.clear_mask(gemm_k_iterations == 0);
     iterator_B.clear_mask(gemm_k_iterations == 0);
@@ -707,85 +720,38 @@ public:
       pipe_state.tmp_accum_.clear();
     }
 
-    // Outer mainloop iteration counter (for optional debug / timing hooks)
-    // unsigned int k_gemm_outer_iter = 0;
-    // int gemm_k_iterations_original = gemm_k_iterations;
-    // int start_sleep_iter = k_gemm_outer_iter + gemm_k_iterations_original * 0.1;
-// #ifdef CUTLASS_SLEEP_ENABLED
-//     if (kCutlassSleepNs > 0u && gemm_k_iterations > Base::kStages) {
-//       unsigned int const phase = (smid + warp_in_cta) % 10u;
-//       unsigned long long const phase_cycles =
-//           static_cast<unsigned long long>(phase) * kCutlassSleepNs;
-//       unsigned long long const __mma_t0 = clock64();
-//       while ((clock64() - __mma_t0) < phase_cycles) {
-//         // intentional phase offset
-//       }
-//     }
-// #endif
-
     // Mainloop
+#if defined(CUTLASS_METHOD_A_RAMP_ENABLED)
+    // v8 (A) soft-launch ramp — linear activity model:
+    //   activity[k] = min(100, start_pct + k*step_pct)
+    //   sleep_ns[k] = iter_time_ns * (100 - activity[k]) / activity[k]
+    // Outer-loop scope only (NOT inside warp_mma_k inner unrolled loop) → no
+    // baseline regression.
+    unsigned int outer_iter_v8 = 0u;
+#endif
     CUTLASS_GEMM_LOOP
     for (; gemm_k_iterations > (-Base::kStages + 1);) {
-        // #ifdef CUTLASS_SLEEP_ENABLED
-        // if (k_gemm_outer_iter >= start_sleep_iter && gemm_k_iterations > Base::kStages && k_gemm_outer_iter % 8 == warp_in_cta % 8) {
-        //   __nanosleep(kCutlassSleepNs);
-        //     // if (kCutlassSleepNs > 0u) {
-        //     //   unsigned long long const __mma_t0 = clock64();
-        //     //   while ((clock64() - __mma_t0) < kCutlassSleepNs) {
-        //     //     // intentional busy wait
-        //     //   }
-        //     // }
-          
-        // }
-        // #endif
-// #if defined(CUTLASS_MMA_MAC_LOOP_TIMING)
-//       if (k_gemm_outer_iter == 0) {
-//         unsigned int const tid =
-//             threadIdx.z * blockDim.y * blockDim.x +
-//             threadIdx.y * blockDim.x +
-//             threadIdx.x;
-//         unsigned int const warp_in_cta = tid / 32u;
-//         // warp 0, lane 0 만 출력 (한 블록당 한 줄)
-//         if (warp_in_cta == 0u && (threadIdx.x & 31u) == 0u) {
-//           unsigned int smid = 0u;
-//           asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-//           unsigned int const block_linear =
-//               blockIdx.x +
-//               blockIdx.y * gridDim.x +
-//               blockIdx.z * gridDim.x * gridDim.y;
-//           printf(
-//               "[CUTLASS_GEMM] outer_iter=%d smid=%u warp_in_cta=%u block_linear=%u "
-//               "blockIdx=(%u,%u,%u) gridDim=(%u,%u,%u) gemm_k_iterations=%d\n",
-//               k_gemm_outer_iter,
-//               smid,
-//               warp_in_cta,
-//               block_linear,
-//               blockIdx.x,
-//               blockIdx.y,
-//               blockIdx.z,
-//               gridDim.x,
-//               gridDim.y,
-//               gridDim.z,
-//               gemm_k_iterations);
-//         }
-//       }
-// #endif
-    #ifdef CUTLASS_SLEEP_ENABLED
-    // if (warp_mma_k == 0 && gemm_k_iterations > Base::kStages && gemm_k_iterations % 2 == warp_in_cta % 2) {
-    // if (kCutlassSleepNs != 0 && warp_mma_k == 0 && gemm_k_iterations > 20 && smid % 2  == gemm_k_iterations % 2) {
-    if ((smid ^ gemm_k_iterations) & 1u) {
-        __nanosleep(kCutlassSleepNs);
-    }
-    #endif
+#if defined(CUTLASS_METHOD_A_RAMP_ENABLED)
+      if (kCutlassRampStartPct < 100u && kCutlassRampIterTimeNs > 0u) {
+        unsigned int const activity =
+            kCutlassRampStartPct + outer_iter_v8 * kCutlassRampStepPct;
+        if (activity < 100u) {
+          unsigned int const sleep_ns =
+              (kCutlassRampIterTimeNs * (100u - activity)) / activity;
+          if (sleep_ns > 0u) {
+            __nanosleep(sleep_ns);
+          }
+        }
+        // activity >= 100: ramp done, no further sleep this kernel.
+      }
+      ++outer_iter_v8;
+#endif
       mac_loop_iter(
         pipe_state,
         accum,
         iterator_A,
         iterator_B,
         gemm_k_iterations);
-        // warp_in_cta,
-        // smid,
-        // k_gemm_outer_iter);
     }
 
     if (Detail::kStagedAccumulation) {
@@ -849,6 +815,30 @@ public:
       IteratorB iterator_B,
       ///< initial value of accumulator
       FragmentC const &src_accum) {
+
+#if defined(CUTLASS_METHOD_A_RAMP_V9_ENABLED)
+    // ── Method A v9 : spatial SM ramp ────────────────────────────────────────
+    // CTA가 prologue() 호출 전에 SM ID 기반 graduated __nanosleep 적용.
+    //   smid < threshold      : delay 0 (즉시 mainloop 진입, 활성 SM 됨)
+    //   smid >= threshold     : slot = smid - threshold,  delay = slot * StepNs
+    //
+    // 효과: device-level "활성 SM 수"가 t=0의 threshold개에서 시작해서
+    //       (max_smid - threshold) * StepNs 시간 동안 graduated 증가.
+    //       → power 가 step 이 아닌 ramp 로 상승.
+    //       → smid PTX lookup 은 operator() 진입 시 1회만 (overhead 거의 0).
+    //       → mainloop / warp_mma_k inner unrolled loop 영향 없음.
+    if (kCutlassRampV9StepNs > 0u) {
+      unsigned int smid_v9 = 0u;
+      asm volatile("mov.u32 %0, %%smid;" : "=r"(smid_v9));
+      if (smid_v9 >= kCutlassRampV9SmidThreshold) {
+        unsigned int const slot = smid_v9 - kCutlassRampV9SmidThreshold;
+        unsigned int const delay_ns = slot * kCutlassRampV9StepNs;
+        if (delay_ns > 0u) {
+          __nanosleep(delay_ns);
+        }
+      }
+    }
+#endif
 
     // Prologue (start fetching iterations of global fragments into shared memory)
     prologue(iterator_A, iterator_B, gemm_k_iterations);
