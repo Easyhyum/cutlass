@@ -1,11 +1,46 @@
 #pragma once
-// ── CUTLASS sleep params ──────────────────────────────────────────────────────
-// bf16_gemm_sm80.cu 가 커널 런치 직전에 cudaMemcpyToSymbol 로 값을 업로드.
-// mma_multistage.h 와 bf16_gemm_sm80.cu 양쪽에서 이 헤더를 include 하지만,
-// #pragma once 덕분에 한 translation unit 내에서 딱 한 번만 정의됨.
+// ── CUTLASS sleep params — v4 (pipeline-aware spin only) ─────────────────────
+// 이전 sleep_ns / sleep_freq 코드는 모두 제거되었고, 유일한 hook은
+// mma_multistage.h의 gmem_wait() 직후 SM-staggered clock64 busy-spin.
+//
+// 이전 버전 (v3 with sleep residue) 백업:
+//   /workspace/custum/baseline_backup/v3_pipeline_aware_with_sleep_residue_20260521/
+//
+// 동작:
+//   spin_cycles(this CTA) = (smid % StaggerMod) * StaggerNs (cycles 단위)
+//   StaggerNs=0 또는 StaggerMod<=1 이면 baseline 동작 (spin 없음).
 //
 // 활성화: 빌드 플래그 -DCUTLASS_SLEEP_ENABLED
 #ifdef CUTLASS_SLEEP_ENABLED
-__constant__ unsigned int kCutlassSleepNs   = 0u;  // sleep 지속 시간(ns), 0=disable
-__constant__ unsigned int kCutlassSleepFreq = 1u;  // 매 N번째 warp_mma_k 마다 sleep
+__constant__ unsigned int kCutlassSleepStaggerNs  = 0u;   // v7 ring rotation: ns per warp sleep
+__constant__ unsigned int kCutlassSleepStaggerMod = 1u;   // legacy / enable flag
+
+// v8 (A) one-shot ramp params (linear activity model):
+//   activity[k] = min(100, start_pct + k * step_pct)
+//   sleep_ns[k] = iter_time_ns * (100 - activity[k]) / activity[k]   if activity<100
+//                 0                                                   otherwise
+//   start_pct  = activity at outer_iter k=0 (e.g. 70 = 70% of full HMMA rate)
+//   step_pct   = per-iter activity increase (e.g. 5 → 70, 75, 80, 85, 90, 95, 100)
+//   iter_time_ns = nominal mainloop outer iter time (host estimate)
+//   start_pct = 100  →  ramp disabled (no sleep, no extra work)
+__constant__ unsigned int kCutlassRampStartPct    = 100u;   // 0..100; 100 = ramp OFF
+__constant__ unsigned int kCutlassRampStepPct     = 100u;   // activity %/iter increment
+__constant__ unsigned int kCutlassRampIterTimeNs  = 0u;     // nominal outer iter time (ns)
+
+// v9 (A) spatial SM ramp (graduated CTA entry delay by smid):
+//   At operator() entry, each CTA reads smid (PTX %%smid). If smid < threshold,
+//   no delay (CTA enters mainloop immediately). If smid >= threshold:
+//     slot     = smid - threshold
+//     delay_ns = slot * StepNs
+//     __nanosleep(delay_ns)
+//
+//   Result: SMs with low smid become active first (high power); SMs with high
+//   smid stay idle then become active in graduated order → device-level
+//   power ramp during the first  (n_total - threshold) * step_ns  window.
+//
+//   threshold = (n_sms × start_pct) / 100  computed on host.
+//   For RTX PRO 6000 Blackwell (188 SMs):  start_pct=70 → threshold=132,
+//   so 132 SMs active immediately, 56 SMs ramping over (56-1)*step_ns.
+__constant__ unsigned int kCutlassRampV9SmidThreshold = 0u;  // smid < this → no delay
+__constant__ unsigned int kCutlassRampV9StepNs        = 0u;  // ns per smid step beyond
 #endif

@@ -5,6 +5,8 @@ python setup_bf16_sm80_kernel.py build_ext --inplace
 python setup_bf16_custom.py build_ext --inplace
 python setup_bf16_gemm.py build_ext --inplace
 python setup_wmma_sleep.py build_ext --inplace
+python setup_bf16_sm80.py build_ext --inplace
+
 
 nvidia-smi -i 3   --query-gpu=timestamp,clocks.current.sm,power.draw.instant,power.draw.average,power.limit,clocks_event_reasons.sw_power_cap,clocks_event_reasons_counters.sw_power_cap   --format=csv   -lms 100 > gpu_power_log_5.csv
 
@@ -12,3 +14,13 @@ nvidia-smi -i 3   --query-gpu=timestamp,clocks.current.sm,power.draw.instant,pow
 # 로그에 찍힌 power.draw.instant 기준 누적 최대 열 추가: gpu_power_log_augment.py
 #   python3 gpu_power_log_augment.py gpu_power_log_5.csv -o gpu_power_log_5_max.csv
 #   nvidia-smi ... | python3 gpu_power_log_augment.py > out.csv
+
+sudo nvidia-smi -i 0 -pm 1
+sudo nvidia-smi --gpu-reset -i 0
+nvidia-smi -i 0 -q -d CLOCK
+nvidia-smi -i 0 -q -d POWER
+nvidia-smi -i 0 -q -d PERFORMANCE
+nvidia-smi -i 0 -q -d TEMPERATURE
+nvidia-smi -rgc
+nvidia-smi -rac
+sudo nvidia-smi -i <gpu_id> -pl <wattage>

@@ -10,7 +10,7 @@ USE_ULIMIT_MEMLOCK=1     # 1 = use --ulimit memlock=-1:-1
 ########################################
 # 3) SET NAME
 ########################################
-NAME=cutlass-ljh-$(whoami)
+NAME=cutlass-ljh-$(whoami)-1
 TARGET_GPUS=3
 GPU_OPTS=("-e" "CUDA_VISIBLE_DEVICES=${TARGET_GPUS}")
 ########################################
@@ -26,6 +26,7 @@ CMD=(docker run -d -it
   --name "${NAME}"
   --gpus "device=${TARGET_GPUS}"
   --privileged
+  --cap-add=SYS_ADMIN
   "${GPU_OPTS[@]}"
   ${IPC_FLAG}
   ${ULIMIT_FLAG}

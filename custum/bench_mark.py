@@ -45,6 +45,7 @@ from collections import defaultdict
 import multiprocessing as mp
 import torch
 import pynvml
+import ctypes
 
 from gpu_profile import GPUMonitor
 # ─────────────────── Qwen3-8B architecture constants ───────────────────
@@ -296,6 +297,105 @@ def _cutlass_cmp_parts(gflops, sm_clock_mhz, cutlass_ref, label):
     ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CUTLASS SM80 GEMM: M축 chunk + async multi-stream wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+#  M (= batch_size × seq_len) 이 m_chunk(=2048) 보다 크면 cutlass 커널을
+#  한 번에 띄우지 않고 M축을 m_chunk 단위로 잘라 각 chunk 를 별도 CUDA
+#  stream 에서 비동기로 실행한 뒤 하나의 출력 버퍼로 합친다.
+#  - 각 sub-stream 은 호출 직전 current stream 의 작업(A,B 준비)을 wait
+#  - 모든 chunk 가 끝난 뒤 current stream 이 모든 sub-stream 을 wait
+#  - 출력은 (M,N) 으로 한 번 사전 할당하고 각 stream 이 자기 슬라이스만
+#    채워 넣음 → 별도의 cat copy 없이 view 슬라이스로 자연스럽게 결합
+#  - stream 은 (device, n_chunks) 별로 persistent pool 에 캐싱
+#  ※ cutlass_sm80.gemm_sm80_v3 는 set_sleep_params 가 __constant__ 메모리에
+#    값을 쓰는 구조라 chunk 마다 다른 sleep 값을 섞으면 race 가능. 모든
+#    chunk 가 같은 (sleep_ns, sleep_freq) 일 때만 사용한다 (이 함수도 그렇게
+#    동작한다).
+_CUTLASS_MULTISTREAM_POOL: dict = {}
+
+
+def _get_cutlass_streams(device: torch.device, n: int):
+    """device 별 persistent CUDA stream pool 에서 최소 n 개를 돌려준다."""
+    key = (device.type, device.index if device.index is not None else -1)
+    pool = _CUTLASS_MULTISTREAM_POOL.setdefault(key, [])
+    while len(pool) < n:
+        pool.append(torch.cuda.Stream(device=device))
+    return pool[:n]
+
+
+def cutlass_sm80_gemm_multistream(A: torch.Tensor,
+                                  B: torch.Tensor,
+                                  cutlass_sm80,
+                                  sleep_ns: int = 0,
+                                  sleep_freq: int = 0,
+                                  m_chunk: int = 2048,
+                                  out: "torch.Tensor | None" = None) -> torch.Tensor:
+    """cutlass_sm80.gemm_sm80_v3 을 M-축 chunk + async multi-stream 으로 실행.
+
+    A: (M,K) BF16, B: (K,N) BF16. M 이 m_chunk 이하이면 그냥 단일 호출로
+    fast-path 처리하고, 그 외에는 ceil(M/m_chunk) 개의 chunk 로 나눠 각자
+    별도 CUDA stream 에서 동시에 cutlass 커널을 띄운 뒤 (M,N) 출력 텐서에
+    슬라이스 단위로 결과를 모은다. 반환값은 그 (M,N) 텐서 하나.
+    """
+    if cutlass_sm80 is None:
+        raise RuntimeError("cutlass_sm80 module is not available")
+    if A.dim() != 2 or B.dim() != 2:
+        raise ValueError(
+            f"expected 2D tensors, got A={tuple(A.shape)} B={tuple(B.shape)}")
+    M, K = A.shape
+    Kb, N = B.shape
+    if K != Kb:
+        raise ValueError(f"K mismatch: A.K={K} vs B.K={Kb}")
+    if m_chunk <= 0:
+        raise ValueError(f"m_chunk must be positive, got {m_chunk}")
+
+    if not A.is_contiguous():
+        A = A.contiguous()
+    if not B.is_contiguous():
+        B = B.contiguous()
+
+    if M <= m_chunk:
+        return cutlass_sm80.gemm_sm80_v3(
+            A, B, sleep_ns=sleep_ns, sleep_freq=sleep_freq)
+
+    if out is None:
+        out = torch.empty((M, N), dtype=A.dtype, device=A.device)
+    else:
+        if (tuple(out.shape) != (M, N)
+                or out.dtype != A.dtype
+                or out.device != A.device):
+            raise ValueError(
+                f"out mismatch: want ({M},{N}) {A.dtype} {A.device}, "
+                f"got {tuple(out.shape)} {out.dtype} {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    num_chunks = (M + m_chunk - 1) // m_chunk
+    streams = _get_cutlass_streams(A.device, num_chunks)
+    current = torch.cuda.current_stream(A.device)
+
+    for s in streams[:num_chunks]:
+        s.wait_stream(current)
+
+    for i in range(num_chunks):
+        start = i * m_chunk
+        end = min(start + m_chunk, M)
+        s = streams[i]
+        A_chunk = A[start:end]            # row-major contiguous view
+        out_slice = out[start:end]        # (chunk, N) 출력 슬라이스
+        with torch.cuda.stream(s):
+            C_chunk = cutlass_sm80.gemm_sm80_v3(
+                A_chunk, B,
+                sleep_ns=sleep_ns, sleep_freq=sleep_freq)
+            out_slice.copy_(C_chunk, non_blocking=True)
+
+    for s in streams[:num_chunks]:
+        current.wait_stream(s)
+
+    return out
+
+
 def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
                                  cutlass_sm80, persistent_sm80, handle, args,
                                  cmp_parts=None):
@@ -309,15 +409,17 @@ def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
         fn()
         torch.cuda.synchronize()
         ni = 1
-        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples = measure(
+        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples, gpu_ms = measure(
             fn, ni, handle, sample_interval=args.nvml_interval)
         flops = qwen3_forward_kernel_flops(B, S, include_lm_head=False)
-        gflops = flops * ni / (el / 1000.0) / 1e9
+        timing_ms = gpu_ms if gpu_ms > 0 else el
+        gflops = flops * ni / (timing_ms / 1000.0) / 1e9
         nj = en * 1e6 / (flops * ni) if ni > 0 else 0.0
         print(
             f"  {'actual_forward':14s} | {matmul_kernel:12s} "
             f"sleep={sleep_ns:6d}ns freq={sleep_freq:4d} iters={ni:3d} | "
-            f"{el:8.1f}ms {gflops:8.1f}GF {pw:6.1f}W "
+            f"wall={el:8.1f}ms gpu={gpu_ms:8.1f}ms "
+            f"{gflops:8.1f}GF {pw:6.1f}W "
             f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C "
             f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)"
             f"{'  [' + ' | '.join(cmp_parts) + ']' if cmp_parts else ''}")
@@ -331,6 +433,7 @@ def measure_qwen3_actual_forward(B, S, matmul_kernel, sleep_ns, sleep_freq,
             "attention_kernel": "flashattention_sdpa",
             "num_iters": ni,
             "elapsed_ms": el,
+            "gpu_elapsed_ms": gpu_ms,
             "energy_mj": en,
             "power_w": pw,
             "sm_clock_mhz": sm_clk,
@@ -437,15 +540,17 @@ def measure_qwen3_mlp_graph_replay(B, S, matmul_kernel, sleep_ns, sleep_freq,
         time.sleep(1)
         ni = auto_iterations(replay, args.target_seconds, pilot_iters=3)
         ni = 1
-        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples = measure(
+        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, _cap, _samples, gpu_ms = measure(
             replay, ni, handle, sample_interval=args.nvml_interval)
         flops = qwen3_mlp_graph_flops(B, S)
-        gflops = flops * ni / (el / 1000.0) / 1e9
+        timing_ms = gpu_ms if gpu_ms > 0 else el
+        gflops = flops * ni / (timing_ms / 1000.0) / 1e9
         nj = en * 1e6 / (flops * ni) if ni > 0 else 0.0
         print(
             f"  {'mlp_graph_replay':14s} | {matmul_kernel:12s} "
             f"sleep={sleep_ns:6d}ns freq={sleep_freq:4d} iters={ni:3d} | "
-            f"{el:8.1f}ms {gflops:8.1f}GF {pw:6.1f}W "
+            f"wall={el:8.1f}ms gpu={gpu_ms:8.1f}ms "
+            f"{gflops:8.1f}GF {pw:6.1f}W "
             f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C "
             f"PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)"
             f"{'  [' + ' | '.join(cmp_parts) + ']' if cmp_parts else ''}")
@@ -459,6 +564,7 @@ def measure_qwen3_mlp_graph_replay(B, S, matmul_kernel, sleep_ns, sleep_freq,
             "sleep_freq": sleep_freq,
             "num_iters": ni,
             "elapsed_ms": el,
+            "gpu_elapsed_ms": gpu_ms,
             "energy_mj": en,
             "power_w": pw,
             "sm_clock_mhz": sm_clk,
@@ -541,10 +647,99 @@ def _instant_power_mw_nvidia_smi(device_idx: int) -> int:
     except Exception:
         return 0
 
+import ctypes
+
+def get_fine_grained_power(device_handle=None):
+    """
+    pynvml 패키지를 완전히 우회하고 순수 ctypes로만 작동합니다.
+    multiprocessing.Process 내부에서 독립적으로 실행되어도 에러가 나지 않습니다.
+    """
+    # 1. NVML C 라이브러리 직접 로드
+    try:
+        nvml_lib = ctypes.CDLL("libnvidia-ml.so")
+    except OSError:
+        nvml_lib = ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so")
+
+    # 2. 하드웨어 샘플 구조체 정의
+    class struct_c_nvmlSample_t(ctypes.Structure):
+        _fields_ = [
+            ('timestamp', ctypes.c_ulonglong),  # 마이크로초(us) 단위 내부 타임스탬프
+            ('sampleValue', ctypes.c_double)    # 하드웨어 센서 즉시 전력 값 (Watts)
+        ]
+
+    # NVML 공식 상숫값 정의
+    NVML_TOTAL_POWER_SAMPLES = 0 
+    MAX_SAMPLES = 2000  # 한 번에 가져올 최대 링 버퍼 샘플 수
+    
+    sample_count = ctypes.c_uint(MAX_SAMPLES)
+    samples_buffer = (struct_c_nvmlSample_t * MAX_SAMPLES)()
+
+    # 3. NVML C API 명시적 바인딩 및 프로토타입 정의
+    # nvmlDeviceGetSamples(nvmlDevice_t, nvmlSamplingType_t, unsigned int*, nvmlSample_t*)
+    nvmlDeviceGetSamples = nvml_lib.nvmlDeviceGetSamples
+    nvmlDeviceGetSamples.argtypes = [
+        ctypes.c_void_p,                      # device handle
+        ctypes.c_int,                         # sampling type
+        ctypes.POINTER(ctypes.c_uint),        # sample count pointer
+        ctypes.POINTER(struct_c_nvmlSample_t)  # samples array pointer
+    ]
+    nvmlDeviceGetSamples.restype = ctypes.c_int
+
+    # 만약 기존 pynvml 장치 핸들이 넘어왔다면 내부 포인터 값만 정수형으로 추출
+    if device_handle is not None:
+        try:
+            # pynvml 핸들 객체 내부에 숨겨진 실제 C 포인터 주소 추출 시도
+            if hasattr(device_handle, 'value'):
+                c_handle = ctypes.c_void_p(device_handle.value)
+            else:
+                c_handle = ctypes.c_void_p(int(device_handle))
+        except Exception:
+            # 추출 실패 시 0번 GPU 다이렉트 바인딩으로 안전장치 마련
+            nvmlInit = nvml_lib.nvmlInit
+            nvmlInit.restype = ctypes.c_int
+            nvmlInit()
+            
+            nvmlDeviceGetHandleByIndex = nvml_lib.nvmlDeviceGetHandleByIndex
+            nvmlDeviceGetHandleByIndex.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+            nvmlDeviceGetHandleByIndex.restype = ctypes.c_int
+            
+            raw_handle = ctypes.c_void_p()
+            nvmlDeviceGetHandleByIndex(3, ctypes.byref(raw_handle)) # 현재 타깃인 GPU 3번 적용
+            c_handle = raw_handle
+    else:
+        # 핸들이 없으면 새로 초기화하여 3번 GPU 핸들을 직접 획득
+        nvmlInit = nvml_lib.nvmlInit
+        nvmlInit.restype = ctypes.c_int
+        nvmlInit()
+        
+        nvmlDeviceGetHandleByIndex = nvml_lib.nvmlDeviceGetHandleByIndex
+        nvmlDeviceGetHandleByIndex.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+        nvmlDeviceGetHandleByIndex.restype = ctypes.c_int
+        
+        raw_handle = ctypes.c_void_p()
+        nvmlDeviceGetHandleByIndex(3, ctypes.byref(raw_handle))
+        c_handle = raw_handle
+
+    # 4. 하드웨어 링 버퍼 덤프 실행
+    result = nvmlDeviceGetSamples(c_handle, NVML_TOTAL_POWER_SAMPLES, ctypes.byref(sample_count), samples_buffer)
+    
+    if result == 0:
+        print(f"\n[NVML 하드웨어 버퍼 덤프 성공] 총 {sample_count.value}개의 Blackwell 1ms 생데이터 확보.")
+        
+        # 상위 5개 샘플 테스트 출력
+        for i in range(min(5, sample_count.value)):
+            t_us = samples_buffer[i].timestamp
+            p_w = samples_buffer[i].sampleValue
+            print(f" -> Hardware Timestamp: {t_us} us | Raw Power: {p_w:.3f} W")
+            
+        # TODO: 스크립트의 기존 CSV 저장 컴포넌트가 있다면 samples_buffer 루프 데이터로 교체 연동
+    else:
+        print(f"[NVML 에러] 하드웨어 샘플 버퍼를 가져오지 못했습니다. 에러 코드: {result}")
 
 def _nvml_sampler_proc(device_idx: int, interval: float,
                         cmd_q: mp.Queue, result_q: mp.Queue,
                         ready_ev: mp.Event, power_source: str = "nvml") -> None:
+
     """프로그램 시작 시 1회 spawn. cmd_q 명령으로 start/stop/exit 제어."""
     import queue as _queue
     pynvml.nvmlInit()
@@ -572,6 +767,7 @@ def _nvml_sampler_proc(device_idx: int, interval: float,
             else:
                 try:
                     pw_mw = int(pynvml.nvmlDeviceGetPowerUsage(handle))
+                    # get_fine_grained_power(handle)
                 except pynvml.NVMLError:
                     pass
             power_mw_samples.append(pw_mw)
@@ -690,7 +886,11 @@ def measure(
         elapsed_ms, energy_mJ, avg_power_W, avg_sm_clock_mhz, avg_temp_c,
         power_violation_before_ns, reference_time_before_ns,
         power_violation_during_ns, reference_time_during_ns, power_violation_ratio,
-        gpu_power_cap_w, nvml_samples.
+        gpu_power_cap_w, nvml_samples, gpu_elapsed_ms.
+
+        elapsed_ms     : wall-clock(ms). 전력/에너지·NVML 정합 기준.
+        gpu_elapsed_ms : CUDA Event 기반 GPU 측 ni번 실행 시간(ms).
+                         CPU launch overhead가 빠져 GFLOP/s 계산에 더 적합.
 
         gpu_power_cap_w: NVML nvmlDeviceGetPowerManagementLimit 기준 현재 설정 상한(W).
 
@@ -724,22 +924,30 @@ def measure(
 
     _sampler_cmd_q.put("start")
 
-    time.sleep(MEASURE_PRE_MARGIN_S)
+    # time.sleep(MEASURE_PRE_MARGIN_S)
 
     torch.cuda.synchronize()
     pv_run0_ns, pr_run0_ns = _nvml_power_violation_snapshot_ns(handle)
+
+    # GPU-side timing via CUDA events — CPU launch overhead 제외 한 순수 GPU 실행 시간
+    gpu_ev0 = torch.cuda.Event(enable_timing=True)
+    gpu_ev1 = torch.cuda.Event(enable_timing=True)
+
     t0 = time.perf_counter()
 
     torch.cuda.cudart().cudaProfilerStart()
+    gpu_ev0.record()
     for _ in range(num_iters):
         fn()
+    gpu_ev1.record()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
     t1 = time.perf_counter()
+    gpu_elapsed_ms = gpu_ev0.elapsed_time(gpu_ev1)
     pv_run1_ns, pr_run1_ns = _nvml_power_violation_snapshot_ns(handle)
 
-    time.sleep(MEASURE_POST_MARGIN_S)
+    # time.sleep(MEASURE_POST_MARGIN_S)
 
     _sampler_cmd_q.put("stop")
 
@@ -812,6 +1020,7 @@ def measure(
         power_violation_ratio,
         gpu_power_cap_w,
         nvml_samples,
+        gpu_elapsed_ms,
     )
 
 
@@ -844,6 +1053,7 @@ DETAIL_CSV_COLUMNS = [
     "count",
     "num_iters",
     "elapsed_ms",
+    "gpu_elapsed_ms",
     "gflops",
     "energy_mj",
     "nj_per_flop",
@@ -858,7 +1068,7 @@ DETAIL_CSV_COLUMNS = [
 ]
 
 DETAIL_FLOAT_KEYS = frozenset({
-    "elapsed_ms", "gflops",
+    "elapsed_ms", "gpu_elapsed_ms", "gflops",
     "energy_mj", "nj_per_flop", "sm_clock_mhz", "temp_c", "gpu_power_cap_w",
     "sample_time_ms", "sample_power_w", "sample_sm_clock_mhz", "sample_temp_c",
 })
@@ -1092,7 +1302,7 @@ def main():
     print(f"pid: {pid}")
     parser = argparse.ArgumentParser(
         description="Qwen3-8B full-forward matmul benchmark with WMMA sleep")
-    parser.add_argument("--device", type=int, default=3)
+    parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--output-csv", default="logs/qwen3_8b_forward.csv")
     parser.add_argument(
         "--run-label",
@@ -1112,6 +1322,7 @@ def main():
         default="logs/cuda_graph_dump",
         help="CUDA Graph debug .dot 저장 디렉터리 (seq_len×batch_size별 하위 폴더)",
     )
+    parser.add_argument("--pm", action="store_true", help="GPU Persistence Mode (keep GPU initialized after script ends, for testing)")
     parser.add_argument(
         "--gpu-power-source",
         choices=("nvml", "nvidia_smi_instant"),
@@ -1126,7 +1337,7 @@ def main():
     parser.add_argument(
         "--nvml-interval",
         type=float,
-        default=0.1,
+        default=0.01,
         help=(
             "NVML 폴링 주기(초). 기본 0.1(100ms)은 드라이버 전력 갱신에 가깝고 "
             "gpu_power_log/nvidia-smi 로그와 비슷한 시간 간격이다. "
@@ -1139,7 +1350,7 @@ def main():
         type=int,
         default=2,
         help="persistent_cta 커널에서 launch할 SM당 CTA 수. 기본값은 2, 실험용으로 8까지 가능.",
-    )
+    ),
     parser.add_argument(
         "--persistent-chunk-tiles",
         type=int,
@@ -1334,9 +1545,10 @@ def main():
     # sleep_ns_list = [0, 500, 1000, 1500, 2047, 2048] ## sm bubbling sleep
     # sleep_ns_list = [0,500, 1000, 1500, 2040, 2200, 2300, 2400] ## sm bubbling sleep
     # sleep_ns_list = [0,30000, 40000, 50000, 60000] ## sm 188
-    sleep_ns_list = [0, 2045, 2047, 2048] ## sm bubbling clock64
-    # sleep_ns_list = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000] ## sm step sleep
-
+    # sleep_ns_list = [0, 2045, 2047, 2048] ## sm bubbling clock64
+    # sleep_ns_list = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000] ## sm step sleep
+    sleep_ns_list = [0, 2045, 2047]
+    sleep_ns_list = [0]
     # sleep_ns_list = [0, 1000, 2000, 3000, 4000, 5000]
     # sleep_ns_list = [0, 1000, 2000, 3000, 4000, 5000]
     # sleep_ns_list = [0, 9, 9, 9, 9]
@@ -1347,7 +1559,7 @@ def main():
     sleep_freq_list = [1024, 256, 64, 16, 4, 1, 0]
     # sleep_freq_list = [1, 2, 4]
     sleep_freq_list = [2, 4, 6, 8, 10, 12]
-    sleep_freq_list = [2]
+    sleep_freq_list = [0]
     # clock_list = [2430, 2130, 1830, 1530, 1230, 930]
     clock_list = [2430]
     # clock_list = [2430]
@@ -1371,9 +1583,10 @@ def main():
     # seq_len_list    = [256, 8192]
     # seq_len_list = [256]
     # seq_len_list    = [8192, 1]
-    seq_len_list    = [8192]
+    seq_len_list    = [8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8]
+    # seq_len_list = [8192]
     # batch_size_list = [16, 32, 64, 128, 512, 1024]
-    batch_size_list = [16]
+    batch_size_list = [64]
     # batch_size_list = [16, 16, 16, 16, 16,16 ]
     # batch_size_list = [8, 16, 32 ,64]
 
@@ -1384,7 +1597,7 @@ def main():
         #     seq_len_list.append(1)
         # batch_size_list.append(16)
     print(seq_len_list, batch_size_list)
-    enable_persistence_mode = False
+    enable_persistence_mode = args.pm
     clock_changed = False
     persistence_mode = None
     try:
@@ -1423,12 +1636,12 @@ def main():
 
         for S in seq_len_list:
             for batch_sz in batch_size_list:
-                if batch_sz * S >= 1024 * 512:
-                    print(f"  ⚠ Skipping B={batch_sz}, S={S} "
-                          f"(tokens={batch_sz*S} > {1024*1024})")
-                    continue
-                else:
-                    print(f"Operating B={batch_sz}, S={S} (tokens={batch_sz*S} <= {1024*1024})")
+                # if batch_sz * S >= 1024 * 512:
+                #     print(f"  ⚠ Skipping B={batch_sz}, S={S} "
+                #           f"(tokens={batch_sz*S} > {1024*1024})")
+                #     continue
+                # else:
+                #     print(f"Operating B={batch_sz}, S={S} (tokens={batch_sz*S} <= {1024*1024})")
                 matmuls = build_layer_matmuls(batch_sz, S)
                 total_flops_fwd = sum(2.0 * m * k * n * cnt
                                       for m, k, n, _, cnt in matmuls)
@@ -1572,8 +1785,9 @@ def main():
                         # warmup_iters 만으로 부족할 때 이 루프가 보완한다.
                         # 최대 SM clock 의 90% 이상에 도달하거나 3초가 지나면 종료.
                         for clock in clock_list:
-                            # set_specific_clock(handle, 0, clock, 3)
-                            # clock_changed = True
+                            if enable_persistence_mode:
+                                set_specific_clock(handle, 0, clock, 3)
+                                clock_changed = True
                             _burn_target_pct = 0.90
                             _burn_timeout_s  = 3.0
                             _burn_start      = time.time()
@@ -1601,29 +1815,65 @@ def main():
                             if kernel_enabled("cublas"):
                                 # ── cuBLAS FP16 baseline ──
                                 fn_cublas = lambda: torch.mm(A, B, out=C_fp16)
-                                ni = auto_iterations(fn_cublas, args.target_seconds)
+                                # ni = auto_iterations(fn_cublas, args.target_seconds)
                                 # warmup_scaled = int(ni * 0.5)
-                                warmup_scaled = 30
-                                ni = 30
-                                for _ in range(warmup_scaled):
-                                    fn_cublas()
+                                warmup_scaled = 0
+                                # for _ in range(warmup_scaled):
+                                #     fn_cublas()
                                 # ni = auto_iterations(fn_cublas, args.target_seconds)
                                 # ni = ni_base
-                                _cg_fp16 = cuda_graph_dot_path(
-                                    args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_fp16")
-                                cuda_graph_capture_debug_dump(fn_cublas, _cg_fp16)
+                                ni = 100
+                                if M>= 524288:
+                                    ni = 30
+                                elif M>= 262144:
+                                    ni = 60
+                                elif M>= 131072:
+                                    ni = 120
+                                elif M >= 65536:
+                                    ni = ni * 2
+                                elif M>= 32768:
+                                    ni = ni * 4
+                                elif M>= 16384:
+                                    ni = ni * 8
+                                elif M>= 8192:
+                                    ni = ni * 16
+                                elif M>= 4096:
+                                    ni = ni * 32
+                                elif M>= 2048:
+                                    ni = ni * 64
+                                elif M>= 1024:
+                                    ni = ni * 128
+                                elif M>= 512:
+                                    ni = ni * 256
+                                elif M>= 256:
+                                    ni = ni * 512
+                                elif M>= 128:
+                                    ni = ni * 1024
+                                elif M>= 64:
+                                    ni = ni * 2048
+                                elif M>= 32:
+                                    ni = ni * 4096
+                                elif M>= 16:
+                                    ni = ni * 8192
+                                elif M>= 8:
+                                    ni = ni * 16384
+                                # _cg_fp16 = cuda_graph_dot_path(
+                                #     args.cuda_graph_dump_dir, batch_sz, S, name, "cublas_fp16")
+                                # cuda_graph_capture_debug_dump(fn_cublas, _cg_fp16)
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize()
                                     torch.cuda.nvtx.range_push(f"{tag} cuBLAS sleep=0ns")
-                                el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
+                                el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples, gpu_ms = measure(
                                     fn_cublas, ni, handle, sample_interval=args.nvml_interval)
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize()
                                     torch.cuda.nvtx.range_pop()
-                                gf = flops_per_gemm * ni / (el / 1000) / 1e9
+                                timing_ms = gpu_ms if gpu_ms > 0 else el
+                                gf = flops_per_gemm * ni / (timing_ms / 1000) / 1e9
                                 nj = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
                                 print(f"  {'cuBLAS':14s} | sleep=     0ns freq=   0  iters={ni:5d} | "
-                                    f"{el:8.1f}ms {gf:8.1f}GF {pw:6.1f}W "
+                                    f"wall={el:8.1f}ms gpu={gpu_ms:8.1f}ms "
+                                    f"{gf:8.1f}GF {pw:6.1f}W "
                                     f"{en:8.0f}mJ {nj:.3f}nJ/F  SM={sm_clk:.0f}MHz  T={temp:.0f}°C"
                                     f"  PVpre={pv_bef}ns/{ref_bef}ns"
                                     f"  PVrun={pv_dur}ns/{ref_dur}ns ({pv_rat * 100:.1f}% NVML ref)")
@@ -1632,7 +1882,8 @@ def main():
                                     layer=name, count=count,
                                     M=M, K=K, N=N, kernel="cublas",
                                     sleep_ns=0, sleep_freq=0, num_iters=ni,
-                                    elapsed_ms=el, gflops=gf, power_w=pw,
+                                    elapsed_ms=el, gpu_elapsed_ms=gpu_ms,
+                                    gflops=gf, power_w=pw,
                                     energy_mj=en, nj_per_flop=nj, sm_clock_mhz=sm_clk,
                                     temp_c=temp,
                                     gpu_power_cap_w=gpu_power_cap_w,
@@ -1690,10 +1941,10 @@ def main():
                             output_bytes = M * N * 4  # FP32
                             free_mem, total_mem = torch.cuda.mem_get_info()
                             wmma_skip = output_bytes > free_mem * 0.8  # leave 20% headroom
-                            if wmma_skip:
-                                print(f"  ⚠ WMMA skipped: output {output_bytes/1e9:.1f}GB "
-                                    f"> avail {free_mem/1e9:.1f}GB (FP32 too large)")
-                                continue
+                            # if wmma_skip:
+                            #     print(f"  ⚠ WMMA skipped: output {output_bytes/1e9:.1f}GB "
+                            #         f"> avail {free_mem/1e9:.1f}GB (FP32 too large)")
+                            #     continue
 
                             # ── 커널 sweep 테이블: (kernel_name, fn_factory, has_sleep) ──
                             # has_sleep=True  → sleep_ns_list 전체를 순회
@@ -1762,6 +2013,23 @@ def main():
                                                                 sleep_freq=_f),
                                     True,   # sleep 지원: mma_multistage.h CUTLASS_SLEEP_ENABLED 블록
                                 ))
+
+                                # ── CUTLASS SM80 multi-stream variant ──────────────────────────
+                                # M(=BS) > 2048 인 경우에만 의미 있는 변종.
+                                # M축을 2048 단위 chunk 로 잘라 별도 CUDA stream 에서
+                                # async 로 cutlass 커널을 동시에 띄우고, 사전 할당한
+                                # (M,N) 출력 텐서의 슬라이스에 결과를 모은다.
+                                if M >= 2048:
+                                    kernel_sweep.insert(1, (
+                                        "cutlass_sm80_multistream",
+                                        lambda _s, _f,
+                                            _A=_A_bf16_cont, _B=_B_bf16_cont:
+                                            cutlass_sm80_gemm_multistream(
+                                                _A, _B, cutlass_sm80,
+                                                sleep_ns=_s, sleep_freq=_f,
+                                                m_chunk=2048),
+                                        True,
+                                    ))
 
                             # ── CUTLASS 3.x SM90 BF16 GEMM (wgmma + TMA) ────────────────────────
                             # SM120에서 BF16은 SM90 wgmma 경로 사용 (tcgen05는 FP4/6/8 전용)
@@ -1876,18 +2144,63 @@ def main():
                                 for sns in sns_iter:
                                     for sfreq in sleep_freq_list:
                                         # if kname == "ptx_sm80" or kname == "cutlass_sm80" or kname == "bf16_custom":
+                                        # cutlass_sm80_multistream 은 cutlass_sm80 의 wrapper 이므로
+                                        # cutlass_sm80 활성화 비트(0x2)에 연동되어 켜진다.
+                                        _kparent = (
+                                            "cutlass_sm80"
+                                            if kname == "cutlass_sm80_multistream"
+                                            else kname
+                                        )
                                         if (
-                                            kname in ("cutlass_sm80", "persistent_cta")
-                                            and kernel_enabled(kname)
+                                            kname in (
+                                                "cutlass_sm80",
+                                                "cutlass_sm80_multistream",
+                                                "persistent_cta",
+                                            )
+                                            and kernel_enabled(_kparent)
                                         ):
                                             pass
                                         else:
                                             continue
                                         fn = lambda _s=sns, _f=sfreq: kfn(_s, _f)
-                                        ni = auto_iterations(fn, args.target_seconds)
+                                        # ni = auto_iterations(fn, args.target_seconds)
                                         # warmup_scaled = int(ni * 0.5)
-                                        warmup_scaled = 30
-                                        ni = 30
+                                        warmup_scaled = 100
+                                        ni = 100
+                                        if M>= 524288:
+                                            ni = 30
+                                        elif M>= 262144:
+                                            ni = 60
+                                        elif M>= 131072:
+                                            ni = 120
+                                        elif M >= 65536:
+                                            ni = ni * 2
+                                        elif M>= 32768:
+                                            ni = ni * 4
+                                        elif M>= 16384:
+                                            ni = ni * 8
+                                        elif M>= 8192:
+                                            ni = ni * 16
+                                        elif M>= 4096:
+                                            ni = ni * 32
+                                        elif M>= 2048:
+                                            ni = ni * 64
+                                        elif M>= 1024:
+                                            ni = ni * 128
+                                        elif M>= 512:
+                                            ni = ni * 256
+                                        elif M>= 256:
+                                            ni = ni * 512
+                                        elif M>= 128:
+                                            ni = ni * 1024
+                                        elif M>= 64:
+                                            ni = ni * 2048
+                                        elif M>= 32:
+                                            ni = ni * 4096
+                                        elif M>= 16:
+                                            ni = ni * 8192
+                                        elif M>= 8:
+                                            ni = ni * 16384
                                         for _ in range(warmup_scaled):
                                             fn()
 
@@ -1902,12 +2215,13 @@ def main():
                                             torch.cuda.synchronize()
                                             torch.cuda.nvtx.range_push(
                                                 f"{tag} {kname} sleep={sns}ns freq={sfreq}")
-                                        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples = measure(
+                                        el, en, pw, sm_clk, temp, pv_bef, ref_bef, pv_dur, ref_dur, pv_rat, gpu_power_cap_w, nvml_samples, gpu_ms = measure(
                                             fn, ni, handle, sample_interval=args.nvml_interval)
                                         if torch.cuda.is_available():
                                             torch.cuda.synchronize()
                                             torch.cuda.nvtx.range_pop()
-                                        gf_k = flops_per_gemm * ni / (el / 1000) / 1e9
+                                        timing_ms = gpu_ms if gpu_ms > 0 else el
+                                        gf_k = flops_per_gemm * ni / (timing_ms / 1000) / 1e9
                                         nj_k = en * 1e6 / (flops_per_gemm * ni) if ni > 0 else 0
                                         if kname == "cutlass_sm80":
                                             ref = {
@@ -1940,7 +2254,8 @@ def main():
 
                                         print(f"  {kname:14s} | sleep={sns:6d}ns freq={sfreq:4d}  "
                                             f"iters={ni:5d} | "
-                                            f"{el:8.1f}ms {gf_k:8.1f}GF {pw:6.1f}W "
+                                            f"wall={el:8.1f}ms gpu={gpu_ms:8.1f}ms "
+                                            f"{gf_k:8.1f}GF {pw:6.1f}W "
                                             f"{en:8.0f}mJ {nj_k:.3f}nJ/F  "
                                             f"SM={sm_clk:.0f}MHz  T={temp:.0f}°C  "
                                             f"PVpre={pv_bef}ns/{ref_bef}ns "
@@ -1951,7 +2266,8 @@ def main():
                                             layer=name, count=count,
                                             M=M, K=K, N=N, kernel=kname,
                                             sleep_ns=sns, sleep_freq=sfreq, num_iters=ni,
-                                            elapsed_ms=el, gflops=gf_k, power_w=pw,
+                                            elapsed_ms=el, gpu_elapsed_ms=gpu_ms,
+                                            gflops=gf_k, power_w=pw,
                                             energy_mj=en, nj_per_flop=nj_k,
                                             sm_clock_mhz=sm_clk, temp_c=temp,
                                             gpu_power_cap_w=gpu_power_cap_w,
@@ -1966,6 +2282,9 @@ def main():
                                         time.sleep(1)
 
                 if workload_enabled("mlp_graph_replay"):
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    time.sleep(1)
                     print(f"\n{'='*72}")
                     print(
                         "  MLP CUDA Graph replay workload  "
@@ -2173,7 +2492,7 @@ def main():
                     "num_layers",
                     "matmul_kernel", "sleep_ns", "sleep_freq",
                     "attention_kernel", "num_iters",
-                    "elapsed_ms", "energy_mj", "power_w",
+                    "elapsed_ms", "gpu_elapsed_ms", "energy_mj", "power_w",
                     "gflops", "nj_per_flop", "total_flops",
                     "sm_clock_mhz", "temp_c",
                     "power_violation_before_ns", "reference_time_before_ns",
@@ -2186,7 +2505,8 @@ def main():
                     for row in actual_forward_results:
                         out = dict(row)
                         for k in (
-                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "elapsed_ms", "gpu_elapsed_ms", "energy_mj",
+                            "power_w", "gflops",
                             "nj_per_flop", "total_flops", "sm_clock_mhz",
                             "temp_c", "power_violation_ratio"):
                             if k in out and isinstance(out[k], float):
@@ -2200,7 +2520,7 @@ def main():
                     "num_layers", "workload",
                     "matmul_kernel", "sleep_ns", "sleep_freq",
                     "num_iters",
-                    "elapsed_ms", "energy_mj", "power_w",
+                    "elapsed_ms", "gpu_elapsed_ms", "energy_mj", "power_w",
                     "gflops", "nj_per_flop", "total_flops",
                     "sm_clock_mhz", "temp_c",
                     "power_violation_before_ns", "reference_time_before_ns",
@@ -2213,7 +2533,8 @@ def main():
                     for row in mlp_graph_results:
                         out = dict(row)
                         for k in (
-                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "elapsed_ms", "gpu_elapsed_ms", "energy_mj",
+                            "power_w", "gflops",
                             "nj_per_flop", "total_flops", "sm_clock_mhz",
                             "temp_c", "power_violation_ratio"):
                             if k in out and isinstance(out[k], float):
@@ -2235,7 +2556,7 @@ def main():
                     "num_layers",
                     "matmul_kernel", "sleep_ns", "sleep_freq",
                     "attention_kernel", "num_iters",
-                    "elapsed_ms", "energy_mj", "power_w",
+                    "elapsed_ms", "gpu_elapsed_ms", "energy_mj", "power_w",
                     "gflops", "nj_per_flop", "total_flops",
                     "sm_clock_mhz", "temp_c",
                     "power_violation_before_ns", "reference_time_before_ns",
@@ -2248,7 +2569,8 @@ def main():
                     for row in actual_forward_results:
                         out = dict(row)
                         for k in (
-                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "elapsed_ms", "gpu_elapsed_ms", "energy_mj",
+                            "power_w", "gflops",
                             "nj_per_flop", "total_flops", "sm_clock_mhz",
                             "temp_c", "power_violation_ratio"):
                             if k in out and isinstance(out[k], float):
@@ -2263,7 +2585,7 @@ def main():
                     "num_layers", "workload",
                     "matmul_kernel", "sleep_ns", "sleep_freq",
                     "num_iters",
-                    "elapsed_ms", "energy_mj", "power_w",
+                    "elapsed_ms", "gpu_elapsed_ms", "energy_mj", "power_w",
                     "gflops", "nj_per_flop", "total_flops",
                     "sm_clock_mhz", "temp_c",
                     "power_violation_before_ns", "reference_time_before_ns",
@@ -2276,7 +2598,8 @@ def main():
                     for row in mlp_graph_results:
                         out = dict(row)
                         for k in (
-                            "elapsed_ms", "energy_mj", "power_w", "gflops",
+                            "elapsed_ms", "gpu_elapsed_ms", "energy_mj",
+                            "power_w", "gflops",
                             "nj_per_flop", "total_flops", "sm_clock_mhz",
                             "temp_c", "power_violation_ratio"):
                             if k in out and isinstance(out[k], float):

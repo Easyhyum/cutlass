@@ -67,6 +67,12 @@
 #ifdef CUTLASS_SLEEP_ENABLED
 #include "cutlass/cutlass_sleep_globals.cuh"
 #endif
+#ifdef CUTLASS_CTA_PROBE_ENABLED
+#include "cutlass/cta_probe_globals.cuh"
+#endif
+#ifdef CUTLASS_WAVE_SLEEP_ENABLED
+#include "cutlass/cta_wave_sleep_globals.cuh"
+#endif
 
 #include "cutlass/aligned_buffer.h"
 #include "cutlass/arch/memory.h"
@@ -746,6 +752,158 @@ public:
       }
       ++outer_iter_v8;
 #endif
+
+#if defined(CUTLASS_WAVE_SLEEP_ENABLED)
+      // ── Per-mac_loop_iter wave-sleep hook ─────────────────────────────────
+      // Mode 0: optional mid-wave bubble (waves 1..N-2). thread-0 + barrier.
+      // Mode 1: ALL-wave staircase by smid (every wave gets the same
+      //         shape — wave-aware power rail leveling rather than wave-0
+      //         init-step pattern).
+      if (kWaveSleepNumWaves >= 3 && kWaveSleepNSm > 0) {
+        int const _wsm_linear =
+            (int(blockIdx.z) * int(gridDim.y) + int(blockIdx.y)) *
+                int(gridDim.x) +
+            int(blockIdx.x);
+        int const _wsm_wave_idx = _wsm_linear / kWaveSleepNSm;
+
+        if (kWaveSleepMode == 1) {
+          // All-wave staircase — every CTA in every wave applies the same
+          // smid-keyed staircase delay at the start of each outer K iter.
+          unsigned int _wsm_smid;
+          asm volatile("mov.u32 %0, %%smid;" : "=r"(_wsm_smid));
+          unsigned int const _wsm_delay = cta_wave_sleep_delay_ns(
+              static_cast<int>(_wsm_smid), kWaveSleepFirstWaveSmidThr,
+              kWaveSleepFirstWaveStepNs, kWaveSleepNSm, kWaveSleepShape);
+          if (_wsm_delay > 0u) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+              __nanosleep(_wsm_delay);
+            }
+            __syncthreads();
+          }
+        }
+        else if (kWaveSleepMode == 4 && kWaveSleepMidWaveNs > 0u) {
+          // Uniform per-iter sleep — every CTA, every mac_loop_iter, fixed delay.
+          // Duty-cycle dial:  duty ≈ mid_ns / (mid_ns + iter_time_ns).
+          // Spreads the SM activity uniformly in time → smooth power scaling
+          // (no spatial staircase, no hash gate).
+          if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            __nanosleep(kWaveSleepMidWaveNs);
+          }
+          __syncthreads();
+        }
+        else if (kWaveSleepMode == 5 && kWaveSleepMidWaveNs > 0u &&
+                 kWaveSleepMidWavePct > 0u) {
+          // Every-N-th-iter sleep — bypasses the nanosleep quantum by
+          // reducing the FREQUENCY of sleep events rather than their size.
+          // N = max(1, 100 / mid_pct).  mid_pct=50 → every 2nd iter, etc.
+          int _wsm_N = static_cast<int>(100u / kWaveSleepMidWavePct);
+          if (_wsm_N < 1) _wsm_N = 1;
+          if ((gemm_k_iterations % _wsm_N) == 0) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+              __nanosleep(kWaveSleepMidWaveNs);
+            }
+            __syncthreads();
+          }
+        }
+        else if (kWaveSleepMode == 6 && kWaveSleepMidWaveNs > 0u &&
+                 kWaveSleepMidWavePct > 0u) {
+          // Mode 6: mode 5 minus __syncthreads().
+          // Only thread-0's warp stalls during the nanosleep; the remaining
+          // warps continue executing the mainloop. SM-level power dip per
+          // event is ~1/4 of mode 5 (one of four warps stalled).
+          int _wsm_N = static_cast<int>(100u / kWaveSleepMidWavePct);
+          if (_wsm_N < 1) _wsm_N = 1;
+          if ((gemm_k_iterations % _wsm_N) == 0) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+              __nanosleep(kWaveSleepMidWaveNs);
+            }
+            // intentionally no __syncthreads() here
+          }
+        }
+        else if (kWaveSleepMode == 9 && g_mem_pressure_buf != nullptr &&
+                 kMemPressureWords > 0 && kWaveSleepMidWavePct > 0u) {
+          // Mode 9: memory-pressure injection.
+          //   Every thread of the CTA reads `mid_pct` words from a
+          //   host-supplied buffer at smid+iter-mixed offsets.
+          //   `first_smid_thr` (reused) is the per-iter stride between reads.
+          //   No __syncthreads — reads are independent per thread.
+          //   The compiler can't dead-code these because of the volatile
+          //   read; the values are XOR-accumulated into a "useless" sink.
+          unsigned int _mp_smid;
+          asm volatile("mov.u32 %0, %%smid;" : "=r"(_mp_smid));
+          unsigned int _mp_acc = 0u;
+          unsigned int const _mp_tid =
+              threadIdx.z * blockDim.y * blockDim.x +
+              threadIdx.y * blockDim.x + threadIdx.x;
+          unsigned int const _mp_n_reads = kWaveSleepMidWavePct;
+          unsigned int const _mp_stride =
+              static_cast<unsigned int>(kWaveSleepFirstWaveSmidThr | 1);
+          unsigned int _mp_off =
+              (_mp_smid * 12345u + static_cast<unsigned int>(gemm_k_iterations) * 4099u
+               + _mp_tid * 17u);
+          CUTLASS_PRAGMA_UNROLL
+          for (unsigned int _mp_i = 0u; _mp_i < 8u; ++_mp_i) {
+            if (_mp_i >= _mp_n_reads) break;
+            unsigned int _mp_idx =
+                _mp_off % static_cast<unsigned int>(kMemPressureWords);
+            unsigned int _mp_val;
+            asm volatile("ld.global.cg.u32 %0, [%1];"
+                         : "=r"(_mp_val)
+                         : "l"(g_mem_pressure_buf + _mp_idx));
+            _mp_acc ^= _mp_val;
+            _mp_off += _mp_stride;
+          }
+          // Prevent dead-code elimination by branching on the accumulator.
+          if (_mp_acc == 0xDEADBEEFu) {
+            __nanosleep(1u);
+          }
+        }
+        else if (kWaveSleepMode == 8 && kWaveSleepMidWaveNs > 0u &&
+                 kWaveSleepMidWavePct > 0u) {
+          // Mode 8: rotational SM stagger — at every outer K iter, 1/N of
+          // the SMs sleep, rest continue with MMA. N = mid_pct. Each SM
+          // idles on its own iter slot, so over the full mainloop every
+          // SM gets equal sleep time → 100% per-SM utilisation, but only
+          // (N-1)/N of SMs issue MMA at any instant → MMA-power peak ↓.
+          unsigned int _ws8_smid;
+          asm volatile("mov.u32 %0, %%smid;" : "=r"(_ws8_smid));
+          unsigned int const _ws8_N = kWaveSleepMidWavePct;
+          unsigned int const _ws8_my_slot   = _ws8_smid % _ws8_N;
+          unsigned int const _ws8_iter_slot =
+              static_cast<unsigned int>(gemm_k_iterations) % _ws8_N;
+          if (_ws8_my_slot == _ws8_iter_slot) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+              __nanosleep(kWaveSleepMidWaveNs);
+            }
+            __syncthreads();
+          }
+        }
+        else if ((kWaveSleepMode == 0 || kWaveSleepMode == 10) &&
+                 kWaveSleepMidWavePct > 0u && kWaveSleepMidWaveNs > 0u &&
+                 _wsm_wave_idx > 0 &&
+                 _wsm_wave_idx < (kWaveSleepNumWaves - 1)) {
+          // Modes 0 / 10 mid-wave bubble — hash-selected fraction of CTAs
+          // sleep for mid_ns ns.  CTA-wide hash ensures all threads agree
+          // before the barrier.  `gemm_k_iterations` is mixed in so the
+          // selected CTA set rotates across outer K iters — no single SM is
+          // always the one sleeping, which spreads tail latency.
+          unsigned int h = kWaveSleepHashSeed;
+          h ^= static_cast<unsigned int>(_wsm_linear) * 0x9E3779B1u;
+          h ^= static_cast<unsigned int>(_wsm_wave_idx) * 0x85EBCA77u;
+          h ^= static_cast<unsigned int>(gemm_k_iterations) * 0x6A09E667u;
+          h ^= (h >> 16);
+          h *= 0xC2B2AE3Du;
+          h ^= (h >> 13);
+          if ((h % 100u) < kWaveSleepMidWavePct) {
+            if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+              __nanosleep(kWaveSleepMidWaveNs);
+            }
+            __syncthreads();
+          }
+        }
+      }
+#endif
+
       mac_loop_iter(
         pipe_state,
         accum,
@@ -816,6 +974,60 @@ public:
       ///< initial value of accumulator
       FragmentC const &src_accum) {
 
+    // ── (wave-sleep entry block removed — first-wave staircase moved
+    //     post-prologue, mid-wave bubble moved into gemm_iters)
+
+#if defined(CUTLASS_WAVE_SLEEP_ENABLED)
+    // ── SM-GATING (mode 7) ───────────────────────────────────────────────────
+    // Deactivate the CTAs landing on smid >= kWaveSleepFirstWaveSmidThr by
+    // returning from operator() before any GEMM work. The grid is still
+    // launched (epilogue may still run with stale accumulators) but the
+    // mainloop power cost is suppressed for the gated SMs.
+    if (kWaveSleepMode == 7 && kWaveSleepNSm > 0 &&
+        kWaveSleepFirstWaveSmidThr > 0) {
+      unsigned int _ws7_smid;
+      asm volatile("mov.u32 %0, %%smid;" : "=r"(_ws7_smid));
+      if (static_cast<int>(_ws7_smid) >= kWaveSleepFirstWaveSmidThr) {
+        // accumulator left at src_accum (no-op iteration); epilogue stores
+        // garbage for these SMs. We don't care for power measurement.
+        accum = src_accum;
+        return;
+      }
+    }
+#endif
+
+#if defined(CUTLASS_CTA_PROBE_ENABLED)
+    // ── CTA dispatch probe ──────────────────────────────────────────────────
+    // Record (smid, globaltimer, blockIdx) for this CTA, then skip the GEMM
+    // mainloop. Only thread 0 of each CTA writes; one slot per CTA so no
+    // synchronization or atomics are needed.
+    //
+    // The grid shape (= the streamk swizzle's chosen launch grid) is
+    // preserved by CUTLASS up to this point, so the recorded mapping is
+    // exactly the dispatch that the real GEMM would have seen.
+    {
+      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        unsigned long long t0;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        unsigned int smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+        int const linear =
+            (int(blockIdx.z) * int(gridDim.y) + int(blockIdx.y)) *
+                int(gridDim.x) +
+            int(blockIdx.x);
+        if (g_cta_probe_smid_out != nullptr && linear < kCtaProbeMaxCtas) {
+          g_cta_probe_smid_out[linear]  = static_cast<int>(smid);
+          g_cta_probe_start_out[linear] = t0;
+          g_cta_probe_bx_out[linear]    = static_cast<int>(blockIdx.x);
+          g_cta_probe_by_out[linear]    = static_cast<int>(blockIdx.y);
+          g_cta_probe_bz_out[linear]    = static_cast<int>(blockIdx.z);
+        }
+      }
+      // Fall through into the real GEMM mainloop — the only effect of the
+      // probe block is the single per-CTA record above.
+    }
+#endif
+
 #if defined(CUTLASS_METHOD_A_RAMP_V9_ENABLED)
     // ── Method A v9 : spatial SM ramp ────────────────────────────────────────
     // CTA가 prologue() 호출 전에 SM ID 기반 graduated __nanosleep 적용.
@@ -846,11 +1058,93 @@ public:
     // Wait until we have at least one completed global fetch stage
     gmem_wait();
 
+#if defined(CUTLASS_WAVE_SLEEP_ENABLED)
+    // ── First-wave INIT STEP LAUNCH (post-prologue staircase) ────────────────
+    // Only active for Mode 0 (wave-0-only staircase).  Mode 1 applies the
+    // staircase inside mac_loop_iter for EVERY wave.
+    if (kWaveSleepMode == 0 && kWaveSleepNumWaves >= 3 && kWaveSleepNSm > 0) {
+      int const _ws_linear =
+          (int(blockIdx.z) * int(gridDim.y) + int(blockIdx.y)) *
+              int(gridDim.x) +
+          int(blockIdx.x);
+      int const _ws_wave_idx = _ws_linear / kWaveSleepNSm;
+      if (_ws_wave_idx == 0) {
+        unsigned int _ws_smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(_ws_smid));
+        unsigned int const _ws_delay = cta_wave_sleep_delay_ns(
+            static_cast<int>(_ws_smid), kWaveSleepFirstWaveSmidThr,
+            kWaveSleepFirstWaveStepNs, kWaveSleepNSm, kWaveSleepShape);
+        if (_ws_delay > 0u) {
+          // thread-0 + barrier pattern: one warp sleeps, others wait at sync.
+          if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            __nanosleep(_ws_delay);
+          }
+          __syncthreads();
+        }
+      }
+    }
+
+    // ── Mode 10: UNIFIED 3-PHASE wave-sleep ────────────────────────────────
+    // Phase 1 (wave 0)      : smid-keyed staircase at operator() entry
+    //                         (first-wave burst prevention).  Fires ONCE per
+    //                         wave-0 CTA, here at post-prologue.
+    // Phase 2 (wave 1..N-2) : mid-wave bubble — handled inside mac_loop_iter
+    //                         (NOT here).  Per-outer-K-iter hash selection
+    //                         using gemm_k_iterations so the gated CTA set
+    //                         rotates across iters → no single SM is always
+    //                         the one sleeping, tail-latency-balanced.
+    // Phase 3 (wave N-1)    : skip everything.
+    if (kWaveSleepMode == 10 && kWaveSleepNumWaves >= 3 && kWaveSleepNSm > 0) {
+      int const _ws10_linear =
+          (int(blockIdx.z) * int(gridDim.y) + int(blockIdx.y)) *
+              int(gridDim.x) +
+          int(blockIdx.x);
+      int const _ws10_wave_idx = _ws10_linear / kWaveSleepNSm;
+
+      if (_ws10_wave_idx == 0) {
+        // Wave-0 staircase (post-prologue).
+        unsigned int _ws10_smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(_ws10_smid));
+        unsigned int const _ws10_delay = cta_wave_sleep_delay_ns(
+            static_cast<int>(_ws10_smid), kWaveSleepFirstWaveSmidThr,
+            kWaveSleepFirstWaveStepNs, kWaveSleepNSm, kWaveSleepShape);
+        if (_ws10_delay > 0u) {
+          if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            __nanosleep(_ws10_delay);
+          }
+          __syncthreads();
+        }
+      }
+      // Mid waves & last wave: nothing here.  Mid bubble runs per-iter inside
+      // mac_loop_iter (see the kWaveSleepMode==10 branch added there).
+    }
+#endif
+
     // Initialize destination accumulators with source accumulators
     accum = src_accum;
 
     // Perform the MAC-iterations
     gemm_iters(gemm_k_iterations, accum, iterator_A, iterator_B);
+
+#if defined(CUTLASS_CTA_PROBE_ENABLED)
+    // ── CTA probe: end timestamp (after mainloop, before epilogue) ──────────
+    // Records the globaltimer when this CTA finished its threadblock-scoped
+    // MAC iterations. Combined with the entry-time start_ns recorded at the
+    // top of operator(), this yields per-CTA mainloop duration.
+    {
+      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        unsigned long long t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        int const linear =
+            (int(blockIdx.z) * int(gridDim.y) + int(blockIdx.y)) *
+                int(gridDim.x) +
+            int(blockIdx.x);
+        if (g_cta_probe_end_out != nullptr && linear < kCtaProbeMaxCtas) {
+          g_cta_probe_end_out[linear] = t1;
+        }
+      }
+    }
+#endif
   }
 
   // Expose pipeline state via alias without changing its original access level
